@@ -47,10 +47,8 @@ const PAGE_SIZE_MM: Record<PaperSize, [number, number]> = {
 
 const MARGIN_MM = 10
 const COLUMNS = 4
+const ROWS = 4
 const GAP_MM = 4
-// tall enough for a card-width QR plus a title, ticket #, amount, label and
-// several wrapped lines of the note text underneath it
-const CARD_HEIGHT_MM = 80
 const CARD_PADDING_MM = 2.5
 
 const drawQr = (
@@ -284,16 +282,12 @@ export const generateLotteryPdf = async (
   const pageHeight = pageHeightMm * MM
   const margin = MARGIN_MM * MM
   const gap = GAP_MM * MM
-  const cardHeight = CARD_HEIGHT_MM * MM
+  // both dimensions fill the page exactly - a fixed 4x4 grid per page,
+  // rather than a fixed card size with leftover space at the bottom
   const cardWidth = (pageWidth - 2 * margin - (COLUMNS - 1) * gap) / COLUMNS
+  const cardHeight = (pageHeight - 2 * margin - (ROWS - 1) * gap) / ROWS
   const padding = CARD_PADDING_MM * MM
-
-  const usableHeight = pageHeight - 2 * margin
-  const rowsPerPage = Math.max(
-    1,
-    Math.floor((usableHeight + gap) / (cardHeight + gap))
-  )
-  const cardsPerPage = rowsPerPage * COLUMNS
+  const cardsPerPage = ROWS * COLUMNS
 
   drawCoverPage(doc, config, {font, boldFont}, pageWidth, pageHeight, preview)
 
@@ -354,75 +348,75 @@ export const generateLotteryPdf = async (
 
     const textX = left + padding
     const textWidth = cardWidth - 2 * padding
-    let cursorY = qrY - 3.5 * MM
+    let cursorY = qrY - 3 * MM
 
     if (preview) {
       p.drawText('PREVIEW - NOT A REAL TICKET', {
         x: textX,
         y: cursorY,
-        size: 6,
+        size: 5.5,
         font: boldFont,
         color: rgb(0.75, 0.15, 0.15)
       })
-      cursorY -= 3.5 * MM
+      cursorY -= 3 * MM
     }
 
     p.drawText(config.title, {
       x: textX,
       y: cursorY,
-      size: 8,
+      size: 7.5,
       font: boldFont,
       maxWidth: textWidth
     })
-    cursorY -= 4 * MM
+    cursorY -= 3.3 * MM
     p.drawText(`Ticket #${String(ticket.index + 1).padStart(3, '0')}`, {
       x: textX,
       y: cursorY,
-      size: 7,
+      size: 6.5,
       font
     })
 
     if (config.showAmount) {
-      cursorY -= 3.5 * MM
+      cursorY -= 3 * MM
       p.drawText(
         `${Math.floor(ticket.amountMsat / 1000).toLocaleString()} sat`,
-        {x: textX, y: cursorY, size: 7, font}
+        {x: textX, y: cursorY, size: 6.5, font}
       )
     }
     if (ticket.label) {
-      cursorY -= 3.5 * MM
+      cursorY -= 3 * MM
       p.drawText(ticket.label, {
         x: textX,
         y: cursorY,
-        size: 7,
+        size: 6.5,
         font,
         maxWidth: textWidth
       })
     }
     if (!preview && !ticket.verified) {
-      cursorY -= 3.5 * MM
+      cursorY -= 3 * MM
       p.drawText('(unsigned by mint)', {
         x: textX,
         y: cursorY,
-        size: 6,
+        size: 5.5,
         font,
         color: rgb(0.6, 0.3, 0)
       })
     }
 
-    cursorY -= 4 * MM
+    cursorY -= 3.3 * MM
     const noteLines = wrapMonospace(
       preview
         ? '(no note yet - appears after splitting)'
         : toBech32Lnurl(ticket.noteUrl),
       monoFont,
-      4.5,
+      4.2,
       textWidth
     )
     for (const line of noteLines) {
       if (cursorY < bottom + padding) break
-      p.drawText(line, {x: textX, y: cursorY, size: 4.5, font: monoFont})
-      cursorY -= 2.4 * MM
+      p.drawText(line, {x: textX, y: cursorY, size: 4.2, font: monoFont})
+      cursorY -= 2.1 * MM
     }
 
     cardOnPage++
