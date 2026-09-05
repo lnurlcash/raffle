@@ -1,0 +1,110 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    # only a version tag (e.g. `v0.1.0`, pushed via `git tag vX.Y.Z && git
+    # push origin vX.Y.Z`) publishes to Pages and cuts a release - a plain
+    # push to main does not
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+# no baseline token rights - each job below declares exactly what it needs
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    permissions:
+      contents: read # actions/checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run tsc
+      - run: npm test
+
+  # build runs the full dependency toolchain (npm ci, vite/esbuild/...), so
+  # it gets no token rights beyond reading the repo: a compromised build-time
+  # dependency can at worst poison the artifact, never touch the deployment
+  # APIs - and the deploy job below only publishes what CI's test job already
+  # validated
+  build:
+    needs: test
+    permissions:
+      contents: read # actions/checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: dist
+          include-hidden-files: true
+      # a second, plain copy of the same dist/ (the Pages artifact above is
+      # packaged for actions/deploy-pages's own OIDC flow, not something a
+      # later job can just untar) - lets `release` attach the exact bytes
+      # that got published, rather than rebuilding and risking drift
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist
+          include-hidden-files: true
+
+  # publishes the pre-built artifact only - no checkout, no npm, nothing
+  # executed here but the SHA-pinned deploy action, so the OIDC/pages-write
+  # rights this job needs are never in the same process as dependency code
+  deploy:
+    needs: build
+    permissions:
+      pages: write # publish to GitHub Pages
+      id-token: write # OIDC token for actions/deploy-pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
+
+  release:
+    # only for an actual version-tag push - workflow_dispatch has no tag to
+    # release, and this only runs once `deploy` has actually published the
+    # tagged build, so a release never appears for a version the site isn't
+    # live at yet
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - name: Package dist and checksum it
+        run: |
+          tar -czf "lnurlcash-lottery-${GITHUB_REF_NAME}.tar.gz" -C dist .
+          sha256sum "lnurlcash-lottery-${GITHUB_REF_NAME}.tar.gz" > "lnurlcash-lottery-${GITHUB_REF_NAME}.tar.gz.sha256"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "lnurlcash-lottery-${GITHUB_REF_NAME}.tar.gz" \
+            "lnurlcash-lottery-${GITHUB_REF_NAME}.tar.gz.sha256"
