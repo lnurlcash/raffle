@@ -48,31 +48,76 @@ const failWith = (
   emit(run, onUpdate)
 }
 
-// Folds two now-known-real secrets (the ticket output and the change output
-// of one split) into the run: fetches each one's authoritative value and
-// callback, then appends the ticket and advances `current` to the change.
-// Used both by the ordinary happy path and by pending-secret resolution -
-// the two differ only in whether a signature is available to carry along.
-const foldSplitOutputs = async (
+// The ordinary happy path: splitNote already resolved, so both outputs
+// already carry a mint-issued signature (its requireSignatures default
+// throws UnverifiableNoteError otherwise - see foldRecoveredOutputs for
+// that case). No extra round trip needed: LUD-25 mints the h output at
+// exactly the amount requested, so only the h2/change side's value is
+// tracked (nominally - payout minus the ticket, not re-queried). One split
+// costs exactly one mint call, matching what splitNote itself already does.
+const foldSignedOutputs = (
   run: PersistedRun,
   ticket: TicketPlan,
   ticketK1: string,
-  ticketSignature: string | undefined,
+  ticketSignature: string,
   changeK1: string,
-  changeSignature: string | undefined
+  changeSignature: string
+): void => {
+  const current = run.current!
+  const verified = verifyNoteSignature(
+    ticketK1,
+    ticket.amountMsat,
+    ticketSignature,
+    run.mintPubkey
+  )
+  const record: TicketRecord = {
+    index: ticket.index,
+    amountMsat: ticket.amountMsat,
+    label: ticket.label,
+    noteUrl: noteUrlOf({
+      k1: ticketK1,
+      amountMsat: ticket.amountMsat,
+      signature: verified ? ticketSignature : undefined,
+      callback: current.callback
+    }),
+    verified
+  }
+  run.tickets = [...run.tickets, record]
+  run.current = {
+    k1: changeK1,
+    amountMsat: current.amountMsat - ticket.amountMsat,
+    signature: changeSignature,
+    callback: current.callback
+  }
+  run.pending = null
+  run.pendingKind = null
+}
+
+// The recovery path: all we have is two secrets this app generated, with no
+// signature - either the mint confirmed a split without signing it, or a
+// split whose fate was ambiguous turned out to have landed. Rotating each
+// one is the only way left to get an offline-verifiable signature (and,
+// incidentally, the change's authoritative value), which is exactly what
+// settleNote does - unlike the happy path above, that extra round trip is
+// the point here, not overhead to avoid.
+const foldRecoveredOutputs = async (
+  run: PersistedRun,
+  ticket: TicketPlan,
+  ticketK1: string,
+  changeK1: string
 ): Promise<void> => {
   const current = run.current!
   const ticketSettled = await settleNote(
     current.callback,
     ticketK1,
     ticket.amountMsat,
-    ticketSignature
+    undefined
   )
   const changeSettled = await settleNote(
     current.callback,
     changeK1,
     current.amountMsat - ticket.amountMsat,
-    changeSignature
+    undefined
   )
   const verified = ticketSettled.signature
     ? verifyNoteSignature(
@@ -132,14 +177,7 @@ const handleMutationError = async (
     run.pendingKind = 'confirmed'
     emit(run, onUpdate)
     try {
-      await foldSplitOutputs(
-        run,
-        ticket,
-        secrets[0]!,
-        undefined,
-        secrets[1]!,
-        undefined
-      )
+      await foldRecoveredOutputs(run, ticket, secrets[0]!, secrets[1]!)
       run.message =
         'One ticket could not be offline-verified (the mint did not sign it), but the split did complete and the ticket is real.'
       emit(run, onUpdate)
@@ -206,13 +244,11 @@ export const resolvePending = async (
     // 'gone': the burn landed, fall through to settle the two secrets below
   }
   try {
-    await foldSplitOutputs(
+    await foldRecoveredOutputs(
       run,
       ticket,
       ticketPending!.k1,
-      undefined,
-      changePending!.k1,
-      undefined
+      changePending!.k1
     )
     run.state = 'running'
     run.message = null
@@ -248,7 +284,14 @@ const continueRun = async (
         [run.current.k1],
         ticket.amountMsat
       )
-      await foldSplitOutputs(
+      if (!split.signature || !split.changeSignature) {
+        // shouldn't happen - splitNote's default requireSignatures throws
+        // UnverifiableNoteError rather than resolving without one
+        throw new Error(
+          'The mint confirmed the split but splitNote resolved without a signature.'
+        )
+      }
+      foldSignedOutputs(
         run,
         ticket,
         split.k1,
