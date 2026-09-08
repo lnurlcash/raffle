@@ -47,6 +47,12 @@ section {
   gap: 1.25rem;
 }
 
+.config-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -60,13 +66,19 @@ label {
 
 input[type='text'],
 input[type='number'],
-select {
+select,
+textarea {
   background: var(--panel);
   border: 1px solid var(--border);
   color: var(--text);
   border-radius: 6px;
   padding: 0.5rem 0.6rem;
   font-size: 0.95rem;
+}
+
+textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
 }
 
 input[type='number'] {

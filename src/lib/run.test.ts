@@ -11,9 +11,15 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {secp256k1} from '@noble/curves/secp256k1.js'
 import {bytesToHex} from '@noble/hashes/utils.js'
-import {hashK1, noteSignatureDigestForHash} from 'lnurlcash-kit'
+import {
+  cashSecretAt,
+  deriveCashDomainNode,
+  hashK1,
+  noteSignatureDigestForHash
+} from 'lnurlcash-kit'
 import {startRun} from './run'
 import {defaultConfig, emptyTier} from './lottery'
+import {cashRootFromPhrase, generateSeedPhrase, nextIndexFor} from './seed'
 import type {PersistedRun} from './storage'
 
 const MINT_URL = 'https://mint.test/w'
@@ -57,12 +63,16 @@ const jsonResponse = (body: unknown): Response =>
 // its outputs by h/h2, and a later request naming their raw k1 is only
 // honoured once it's checked against that commitment (activateByK1) - same
 // as what happens when a chain of splits keeps spending the previous
-// split's own change output, exactly what this app's run loop does.
+// split's own change output, exactly what this app's run loop does. Also
+// answers a hash-only informational lookup (fetchNoteInfoByHash - no k1 on
+// the wire) against that same commitment, for a note never separately
+// revealed - exactly what the final leftover is until run.ts's fee check.
 const createMockMint = (
   privateKey: Uint8Array,
   mintPubkey: string,
   initialK1: string,
-  initialAmountMsat: number
+  initialAmountMsat: number,
+  feePerSplitMsat = 0
 ) => {
   const notes = new Map<string, {amountMsat: number; spent: boolean}>()
   const committed = new Map<string, number>() // hash -> amountMsat
@@ -86,7 +96,33 @@ const createMockMint = (
     const h = params.get('h')
     const h2 = params.get('h2')
 
-    if (!k1) return jsonResponse({status: 'ERROR', reason: 'missing k1'})
+    if (!k1) {
+      if (!h) return jsonResponse({status: 'ERROR', reason: 'missing k1'})
+      // hash-only lookup: check both a note already revealed by some other
+      // request, and one only ever committed-by-hash so far
+      for (const [noteK1, note] of notes) {
+        if (!note.spent && hashK1(noteK1) === h) {
+          return jsonResponse({
+            tag: 'withdrawRequest',
+            callback: MINT_URL,
+            minWithdrawable: 0,
+            maxWithdrawable: note.amountMsat,
+            mintPubkey
+          })
+        }
+      }
+      const committedAmount = committed.get(h)
+      if (committedAmount !== undefined) {
+        return jsonResponse({
+          tag: 'withdrawRequest',
+          callback: MINT_URL,
+          minWithdrawable: 0,
+          maxWithdrawable: committedAmount,
+          mintPubkey
+        })
+      }
+      return jsonResponse({status: 'ERROR', reason: 'Unknown note.'})
+    }
     activateByK1(k1)
     const note = notes.get(k1)
     if (!note || note.spent) {
@@ -99,7 +135,7 @@ const createMockMint = (
         return jsonResponse({status: 'ERROR', reason: 'invalid split request'})
       }
       note.spent = true
-      const changeAmountMsat = note.amountMsat - amountMsat
+      const changeAmountMsat = note.amountMsat - amountMsat - feePerSplitMsat
       committed.set(h, amountMsat)
       committed.set(h2, changeAmountMsat)
       return jsonResponse({
@@ -168,9 +204,108 @@ describe('startRun against a mock mint', () => {
     ])
     expect(final.leftover?.amountMsat).toBe(100_000 - 50_000 - 30_000)
 
-    // the fixed bug's whole point: one informational GET to start, then
-    // exactly one mint call per ticket - never the settle-triggered rotate
-    // pair (an extra GET + rotate) that used to follow every split
-    expect(mint.calls).toHaveLength(3)
+    // the fixed bug's whole point: one informational GET to start, one mint
+    // call per ticket - never the settle-triggered rotate pair (an extra
+    // GET + rotate) that used to follow every split - plus one hash-only
+    // lookup at the very end to confirm the leftover's real value/fees
+    expect(mint.calls).toHaveLength(4)
+    expect(final.usesSeed).toBe(false)
+    expect(final.feesMsat).toBe(0)
+  })
+
+  it('calculates total mint fees as the gap between nominal and authoritative leftover value', async () => {
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+    const feePerSplitMsat = 137
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat,
+      feePerSplitMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [
+        {...emptyTier(), count: 1, amountSat: 50, label: 'Grand prize'},
+        {...emptyTier(), count: 1, amountSat: 30, label: ''}
+      ]
+    }
+
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+
+    const final = runs.at(-1)!
+    expect(final.state).toBe('done')
+    // ticket amounts are exact regardless of fees - only the leftover
+    // (fed by two fee-shaved change outputs in a row) absorbs them
+    expect(final.tickets.map(t => t.amountMsat).sort((a, b) => a - b)).toEqual([
+      30_000, 50_000
+    ])
+    const expectedLeftover = 100_000 - 50_000 - 30_000 - 2 * feePerSplitMsat
+    expect(final.leftover?.amountMsat).toBe(expectedLeftover)
+    expect(final.leftover?.verified).toBe(true)
+    expect(final.feesMsat).toBe(2 * feePerSplitMsat)
+  })
+
+  it('derives ticket secrets from an active seed, in index order, and advances the persisted counter', async () => {
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const cashRoot = cashRootFromPhrase(generateSeedPhrase())
+    const host = 'mint.test' // serverOf(MINT_URL)
+    const domainNode = deriveCashDomainNode(cashRoot, host)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [
+        {...emptyTier(), count: 1, amountSat: 50, label: 'Grand prize'},
+        {...emptyTier(), count: 1, amountSat: 30, label: ''}
+      ]
+    }
+
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run),
+      cashRoot
+    )
+
+    const final = runs.at(-1)!
+    expect(final.state).toBe('done')
+    expect(final.usesSeed).toBe(true)
+
+    const byIndex = [...final.tickets].sort((a, b) => a.index - b.index)
+    const k1Of = (noteUrl: string) => new URL(noteUrl).searchParams.get('k1')
+
+    // splitNote draws newK1 then changeK1 per call: ticket 1's secret is
+    // index 0, its change (input to the next split) is index 1, ticket 2's
+    // secret is index 2, and the final leftover is index 3
+    expect(k1Of(byIndex[0]!.noteUrl)).toBe(cashSecretAt(domainNode, 0))
+    expect(k1Of(byIndex[1]!.noteUrl)).toBe(cashSecretAt(domainNode, 2))
+    expect(k1Of(final.leftover!.noteUrl)).toBe(cashSecretAt(domainNode, 3))
+
+    // two splits * two draws each - persisted durably, not just in memory
+    expect(nextIndexFor(host)).toBe(4)
   })
 })

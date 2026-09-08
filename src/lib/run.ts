@@ -7,6 +7,8 @@
 import {
   resolveNoteInput,
   fetchNoteInfo,
+  fetchNoteInfoByHash,
+  hashK1,
   splitNote,
   settleNote,
   buildNoteUrl,
@@ -14,10 +16,14 @@ import {
   verifyNoteSignature,
   probeBurnedNote,
   newSecretsOf,
+  serverOf,
   AmbiguousMintError,
-  PendingNoteError
+  PendingNoteError,
+  type CashNode,
+  type RandomSecret
 } from 'lnurlcash-kit'
 import {planTickets, type LotteryConfig, type TicketPlan} from './lottery'
+import {createPersistentRandomSecret} from './seed'
 import {
   saveRun,
   type PersistedRun,
@@ -104,20 +110,24 @@ const foldRecoveredOutputs = async (
   run: PersistedRun,
   ticket: TicketPlan,
   ticketK1: string,
-  changeK1: string
+  changeK1: string,
+  randomSecret: RandomSecret | undefined
 ): Promise<void> => {
   const current = run.current!
+  const options = randomSecret ? {randomSecret} : undefined
   const ticketSettled = await settleNote(
     current.callback,
     ticketK1,
     ticket.amountMsat,
-    undefined
+    undefined,
+    options
   )
   const changeSettled = await settleNote(
     current.callback,
     changeK1,
     current.amountMsat - ticket.amountMsat,
-    undefined
+    undefined,
+    options
   )
   const verified = ticketSettled.signature
     ? verifyNoteSignature(
@@ -158,7 +168,8 @@ const handleMutationError = async (
   err: unknown,
   run: PersistedRun,
   ticket: TicketPlan,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  randomSecret: RandomSecret | undefined
 ): Promise<void> => {
   const secrets = newSecretsOf(err)
   if (secrets.length === 2 && !(err instanceof AmbiguousMintError)) {
@@ -177,7 +188,13 @@ const handleMutationError = async (
     run.pendingKind = 'confirmed'
     emit(run, onUpdate)
     try {
-      await foldRecoveredOutputs(run, ticket, secrets[0]!, secrets[1]!)
+      await foldRecoveredOutputs(
+        run,
+        ticket,
+        secrets[0]!,
+        secrets[1]!,
+        randomSecret
+      )
       run.message =
         'One ticket could not be offline-verified (the mint did not sign it), but the split did complete and the ticket is real.'
       emit(run, onUpdate)
@@ -219,7 +236,8 @@ const handleMutationError = async (
 export const resolvePending = async (
   run: PersistedRun,
   ticket: TicketPlan,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  randomSecret: RandomSecret | undefined
 ): Promise<boolean> => {
   if (!run.pending || !run.current) return true
   const [ticketPending, changePending] = run.pending
@@ -248,7 +266,8 @@ export const resolvePending = async (
       run,
       ticket,
       ticketPending!.k1,
-      changePending!.k1
+      changePending!.k1,
+      randomSecret
     )
     run.state = 'running'
     run.message = null
@@ -267,13 +286,23 @@ export const resolvePending = async (
 // unprinted leftover note.
 const continueRun = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  cashRoot: CashNode | null
 ): Promise<void> => {
+  // built once per resume, from whatever host the note we're splitting is
+  // actually at - a run only ever touches one mint, so one source for its
+  // whole duration is correct even across a page reload (createPersistentRandomSecret
+  // resumes from the latest persisted index itself, see seed.ts)
+  const randomSecret =
+    cashRoot && run.current
+      ? createPersistentRandomSecret(cashRoot, serverOf(run.current.callback))
+      : undefined
+
   while (run.current && run.tickets.length < run.plan.length) {
     const ticket = run.plan[run.tickets.length]!
 
     if (run.pending) {
-      const clear = await resolvePending(run, ticket, onUpdate)
+      const clear = await resolvePending(run, ticket, onUpdate, randomSecret)
       if (!clear) return
       continue
     }
@@ -282,7 +311,8 @@ const continueRun = async (
       const split = await splitNote(
         run.current.callback,
         [run.current.k1],
-        ticket.amountMsat
+        ticket.amountMsat,
+        randomSecret ? {randomSecret} : undefined
       )
       if (!split.signature || !split.changeSignature) {
         // shouldn't happen - splitNote's default requireSignatures throws
@@ -303,27 +333,52 @@ const continueRun = async (
       run.message = null
       emit(run, onUpdate)
     } catch (err) {
-      await handleMutationError(err, run, ticket, onUpdate)
+      await handleMutationError(err, run, ticket, onUpdate, randomSecret)
       if (run.state !== 'running') return
     }
   }
 
   if (run.current && run.tickets.length === run.plan.length) {
+    // Every ticket's own value is exact (LUD-25 mints the h output at
+    // precisely the amount requested), so the running `current.amountMsat`
+    // - tracked nominally between splits to avoid an extra round trip per
+    // split, see foldSignedOutputs - only ever drifts from reality on the
+    // h2/change side, if the mint charges a split fee. That drift is
+    // invisible until now: one hash-only lookup (no k1 disclosed, no
+    // rotate, nothing mutated) reveals the note's authoritative value, and
+    // the gap between it and the nominal figure is exactly the mint fees
+    // charged across every split in this run, in aggregate. A failed
+    // lookup here - just a network hiccup - must not fail an otherwise
+    // finished run: fees are reported unknown, not zero.
+    const nominalAmountMsat = run.current.amountMsat
+    let amountMsat = nominalAmountMsat
+    let feesMsat: number | null = null
+    try {
+      const info = await fetchNoteInfoByHash(
+        run.current.callback,
+        hashK1(run.current.k1)
+      )
+      amountMsat = info.maxWithdrawable
+      feesMsat = nominalAmountMsat - amountMsat
+    } catch {
+      // leave amountMsat at the nominal figure and feesMsat unknown
+    }
     const leftover: TicketRecord = {
       index: -1,
-      amountMsat: run.current.amountMsat,
+      amountMsat,
       label: 'Leftover (not printed)',
-      noteUrl: noteUrlOf(run.current),
+      noteUrl: noteUrlOf({...run.current, amountMsat}),
       verified: run.current.signature
         ? verifyNoteSignature(
             run.current.k1,
-            run.current.amountMsat,
+            amountMsat,
             run.current.signature,
             run.mintPubkey
           )
         : false
     }
     run.leftover = leftover
+    run.feesMsat = feesMsat
     run.current = null
     run.state = 'done'
     run.message = null
@@ -334,7 +389,8 @@ const continueRun = async (
 export const startRun = async (
   noteInput: string,
   config: LotteryConfig,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  cashRoot: CashNode | null = null
 ): Promise<void> => {
   const url = resolveNoteInput(noteInput)
   if (!url) throw new Error('That is not a recognizable bearer note.')
@@ -364,26 +420,30 @@ export const startRun = async (
     pendingKind: null,
     state: 'running',
     message: null,
-    leftover: null
+    leftover: null,
+    feesMsat: null,
+    usesSeed: cashRoot !== null
   }
   emit(run, onUpdate)
-  await continueRun(run, onUpdate)
+  await continueRun(run, onUpdate, cashRoot)
 }
 
 export const resumeRun = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  cashRoot: CashNode | null = null
 ): Promise<void> => {
   run.state = 'running'
   emit(run, onUpdate)
-  await continueRun(run, onUpdate)
+  await continueRun(run, onUpdate, cashRoot)
 }
 
 // Manual retry for a run parked in 'needs-check' - re-probes/settles the
 // stashed pending secrets, and keeps splitting if that clears it.
 export const checkPending = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void
+  onUpdate: (run: PersistedRun) => void,
+  cashRoot: CashNode | null = null
 ): Promise<void> => {
-  await continueRun(run, onUpdate)
+  await continueRun(run, onUpdate, cashRoot)
 }

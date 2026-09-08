@@ -63,6 +63,17 @@ export type PersistedRun = {
   // the note left over after the last planned ticket - real value, never
   // printed, handed back to the organizer once the run finishes
   leftover: TicketRecord | null
+  // total mint fees charged across every split in this run, in aggregate -
+  // the gap between what the leftover should nominally be worth (payout
+  // minus every ticket, assuming zero fees) and what it's authoritatively
+  // worth once the run finishes and that's actually checked. null until the
+  // run is done, or if that one confirming lookup couldn't be completed -
+  // never assumed to be zero just because it's unknown.
+  feesMsat: number | null
+  // true if this run's secrets were derived from the active seed (see
+  // seed.ts) rather than drawn from the CSPRNG - i.e. whether recovery.ts's
+  // scan can find these tickets again from the seed phrase alone
+  usesSeed: boolean
 }
 
 export const loadRun = (): PersistedRun | null => {

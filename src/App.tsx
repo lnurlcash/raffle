@@ -1,13 +1,17 @@
 import {createSignal, Show} from 'solid-js'
+import type {CashNode} from 'lnurlcash-kit'
 import NoteInput, {type NoteBalance} from './components/NoteInput'
 import ConfigForm from './components/ConfigForm'
 import RunView from './components/RunView'
 import ResumeBanner from './components/ResumeBanner'
+import SeedPanel from './components/SeedPanel'
+import RecoveryPanel from './components/RecoveryPanel'
 import {defaultConfig, validateConfig, ticketCount} from './lib/lottery'
 import {loadRun, saveRun, clearRun, type PersistedRun} from './lib/storage'
 import {startRun, resumeRun} from './lib/run'
 import {generateLotteryPdf, previewTickets} from './lib/pdf'
 import {ticketsToCsv} from './lib/csv'
+import {loadCashRoot} from './lib/seed'
 
 const App = () => {
   const [run, setRun] = createSignal<PersistedRun | null>(loadRun())
@@ -24,6 +28,7 @@ const App = () => {
   const [starting, setStarting] = createSignal(false)
   const [startError, setStartError] = createSignal<string | null>(null)
   const [retrying, setRetrying] = createSignal(false)
+  const [cashRoot, setCashRoot] = createSignal<CashNode | null>(loadCashRoot())
 
   const validationError = () =>
     validateConfig(config(), balance()?.maxWithdrawableMsat ?? null)
@@ -40,7 +45,7 @@ const App = () => {
     setStartError(null)
     setTouched(true)
     try {
-      await startRun(noteValue(), config(), setRun)
+      await startRun(noteValue(), config(), setRun, cashRoot())
     } catch (err) {
       setStartError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -54,7 +59,7 @@ const App = () => {
     if (!current) return
     setRetrying(true)
     try {
-      await resumeRun(current, setRun)
+      await resumeRun(current, setRun, cashRoot())
     } finally {
       setRetrying(false)
     }
@@ -66,7 +71,7 @@ const App = () => {
     setTouched(true)
     setRetrying(true)
     try {
-      await resumeRun(current, setRun)
+      await resumeRun(current, setRun, cashRoot())
     } finally {
       setRetrying(false)
     }
@@ -137,6 +142,15 @@ const App = () => {
       <p class="tagline">
         Split one bearer note into many, print them as cut-and-roll tickets.
       </p>
+
+      <SeedPanel
+        active={!!cashRoot()}
+        onActivate={setCashRoot}
+        onForget={() => setCashRoot(null)}
+      />
+      <Show when={cashRoot()}>
+        {root => <RecoveryPanel cashRoot={root()} />}
+      </Show>
 
       <Show when={run() && run()!.state !== 'done' && !touched()}>
         <ResumeBanner
