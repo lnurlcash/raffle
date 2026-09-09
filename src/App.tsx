@@ -6,6 +6,7 @@ import RunView from './components/RunView'
 import ResumeBanner from './components/ResumeBanner'
 import SeedPanel from './components/SeedPanel'
 import RecoveryPanel from './components/RecoveryPanel'
+import Footer from './components/Footer'
 import {defaultConfig, validateConfig, ticketCount} from './lib/lottery'
 import {loadRun, saveRun, clearRun, type PersistedRun} from './lib/storage'
 import {startRun, resumeRun, rotateTicketRecord} from './lib/run'
@@ -286,6 +287,8 @@ const App = () => {
           retrying={retrying()}
         />
       </Show>
+
+      <Footer />
     </main>
   )
 }
