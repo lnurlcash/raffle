@@ -4,8 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0a0c10" />
+    <!-- this app fetches arbitrary mint URLs cross-origin; don't leak the
+    hosting origin to every one of them via Referer (the Origin header on
+    CORS requests is unaffected by this and can't be removed here) -->
     <meta name="referrer" content="same-origin" />
-    <title>LNURLcash Raffle</title>
+    <meta
+      name="description"
+      content="Split one LNURLcash bearer note into many smaller ones and print them as cut-and-roll raffle tickets, each with its own QR code."
+    />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <title>LNURLcash Raffle - print-a-raffle ticket splitter</title>
   </head>
   <body>
     <noscript>You need to enable JavaScript to run this app.</noscript>
