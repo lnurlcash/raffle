@@ -1,10 +1,13 @@
 import {createSignal, For, Show} from 'solid-js'
-import {buildNoteUrl, type CashNode} from 'lnurlcash-kit'
+import {buildNoteUrl, serverOf, type CashNode} from 'lnurlcash-kit'
 import {
+  combineNotes,
   scanForNotes,
+  type CombinedNote,
   type RecoveredNote,
   type ScanProgress
 } from '../lib/recovery'
+import {createPersistentRandomSecret} from '../lib/seed'
 
 type Props = {
   cashRoot: CashNode
@@ -17,11 +20,20 @@ const RecoveryPanel = (props: Props) => {
   const [results, setResults] = createSignal<RecoveredNote[] | null>(null)
   const [error, setError] = createSignal<string | null>(null)
 
+  const [confirmingCombine, setConfirmingCombine] = createSignal(false)
+  const [combining, setCombining] = createSignal(false)
+  const [combined, setCombined] = createSignal<CombinedNote | null>(null)
+  const [combineError, setCombineError] = createSignal<string | null>(null)
+  const [copied, setCopied] = createSignal(false)
+
   const scan = async () => {
     setScanning(true)
     setError(null)
     setResults(null)
     setProgress(null)
+    setCombined(null)
+    setCombineError(null)
+    setConfirmingCombine(false)
     try {
       const found = await scanForNotes(
         props.cashRoot,
@@ -38,6 +50,37 @@ const RecoveryPanel = (props: Props) => {
 
   const totalSat = () =>
     Math.floor((results() ?? []).reduce((n, r) => n + r.amountMsat, 0) / 1000)
+
+  const combine = async () => {
+    const found = results()
+    if (!found || found.length < 2) return
+    setCombining(true)
+    setCombineError(null)
+    try {
+      const host = serverOf(mintUrl().trim())
+      const randomSecret = createPersistentRandomSecret(props.cashRoot, host)
+      const result = await combineNotes(
+        found[0]!.callback,
+        found.map(n => n.k1),
+        randomSecret
+      )
+      setCombined(result)
+      setResults(null)
+    } catch (err) {
+      setCombineError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCombining(false)
+      setConfirmingCombine(false)
+    }
+  }
+
+  const copyCombined = async () => {
+    const note = combined()
+    if (!note) return
+    await navigator.clipboard.writeText(note.noteUrl)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   return (
     <div class="config-form">
@@ -122,7 +165,70 @@ const RecoveryPanel = (props: Props) => {
                 </For>
               </tbody>
             </table>
+
+            <Show when={found().length > 1}>
+              <Show
+                when={!confirmingCombine()}
+                fallback={
+                  <div class="banner warn">
+                    <p>
+                      This will burn all {found().length} notes above and mint
+                      one worth {totalSat().toLocaleString()} sat. This cannot
+                      be undone. Continue?
+                    </p>
+                    <div class="row">
+                      <button
+                        type="button"
+                        disabled={combining()}
+                        onClick={combine}
+                      >
+                        {combining() ? 'Combining…' : 'Yes, combine them'}
+                      </button>
+                      <button
+                        type="button"
+                        class="ghost"
+                        disabled={combining()}
+                        onClick={() => setConfirmingCombine(false)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                }
+              >
+                <button
+                  type="button"
+                  class="ghost"
+                  onClick={() => setConfirmingCombine(true)}
+                >
+                  Combine all into one note
+                </button>
+              </Show>
+            </Show>
           </Show>
+        )}
+      </Show>
+
+      <Show when={combineError()}>
+        <p class="error">{combineError()}</p>
+      </Show>
+
+      <Show when={combined()}>
+        {note => (
+          <div class="leftover">
+            <p>
+              Combined into one note worth{' '}
+              {Math.floor(note().amountMsat / 1000).toLocaleString()} sat
+              {!note().verified && " (couldn't be offline-verified)"} - copy it
+              into a wallet to spend it:
+            </p>
+            <code class="note-url">{note().noteUrl}</code>
+            <div class="row">
+              <button type="button" class="ghost" onClick={copyCombined}>
+                {copied() ? 'Copied!' : 'Copy note'}
+              </button>
+            </div>
+          </div>
         )}
       </Show>
     </div>

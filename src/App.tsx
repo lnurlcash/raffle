@@ -1,5 +1,5 @@
 import {createSignal, Show} from 'solid-js'
-import type {CashNode} from 'lnurlcash-kit'
+import {serverOf, type CashNode} from 'lnurlcash-kit'
 import NoteInput, {type NoteBalance} from './components/NoteInput'
 import ConfigForm from './components/ConfigForm'
 import RunView from './components/RunView'
@@ -8,10 +8,10 @@ import SeedPanel from './components/SeedPanel'
 import RecoveryPanel from './components/RecoveryPanel'
 import {defaultConfig, validateConfig, ticketCount} from './lib/lottery'
 import {loadRun, saveRun, clearRun, type PersistedRun} from './lib/storage'
-import {startRun, resumeRun} from './lib/run'
+import {startRun, resumeRun, rotateTicketRecord} from './lib/run'
 import {generateLotteryPdf, previewTickets} from './lib/pdf'
 import {ticketsToCsv} from './lib/csv'
-import {loadCashRoot} from './lib/seed'
+import {loadCashRoot, createPersistentRandomSecret} from './lib/seed'
 
 const App = () => {
   const [run, setRun] = createSignal<PersistedRun | null>(loadRun())
@@ -29,6 +29,14 @@ const App = () => {
   const [startError, setStartError] = createSignal<string | null>(null)
   const [retrying, setRetrying] = createSignal(false)
   const [cashRoot, setCashRoot] = createSignal<CashNode | null>(loadCashRoot())
+
+  // every planned ticket minted is what actually determines the run is
+  // finished, same reasoning as RunView's own allMinted - relying on the
+  // `state` string alone as the only way to reach the results view risks
+  // stranding a genuinely-finished run behind a resume prompt if it's ever
+  // out of sync with reality
+  const isRunComplete = (r: PersistedRun) =>
+    r.tickets.length >= r.plan.length && r.plan.length > 0
 
   const validationError = () =>
     validateConfig(config(), balance()?.maxWithdrawableMsat ?? null)
@@ -106,7 +114,11 @@ const App = () => {
   const downloadCsv = () => {
     const current = run()
     if (!current) return
-    const csv = ticketsToCsv(current.tickets, current.leftover)
+    const csv = ticketsToCsv(
+      current.tickets,
+      current.leftover,
+      current.feesMsat
+    )
     triggerDownload(
       csv,
       `${current.config.title.trim() || 'lottery'}-tickets.csv`,
@@ -123,6 +135,32 @@ const App = () => {
       `${config().title.trim() || 'lottery'}-preview.pdf`,
       'application/pdf'
     )
+  }
+
+  const rotateTicket = async (index: number) => {
+    const current = run()
+    if (!current) return
+    const isLeftover = index === -1
+    const target = isLeftover
+      ? current.leftover
+      : current.tickets.find(t => t.index === index)
+    if (!target) return
+    const randomSecret = cashRoot()
+      ? createPersistentRandomSecret(cashRoot()!, serverOf(target.noteUrl))
+      : undefined
+    const updated = await rotateTicketRecord(
+      target,
+      current.mintPubkey,
+      randomSecret
+    )
+    const nextRun: PersistedRun = isLeftover
+      ? {...current, leftover: updated}
+      : {
+          ...current,
+          tickets: current.tickets.map(t => (t.index === index ? updated : t))
+        }
+    saveRun(nextRun)
+    setRun(nextRun)
   }
 
   const startNew = () => {
@@ -143,16 +181,18 @@ const App = () => {
         Split one bearer note into many, print them as cut-and-roll tickets.
       </p>
 
-      <SeedPanel
-        active={!!cashRoot()}
-        onActivate={setCashRoot}
-        onForget={() => setCashRoot(null)}
-      />
-      <Show when={cashRoot()}>
-        {root => <RecoveryPanel cashRoot={root()} />}
+      <Show when={!run()}>
+        <SeedPanel
+          active={!!cashRoot()}
+          onActivate={setCashRoot}
+          onForget={() => setCashRoot(null)}
+        />
+        <Show when={cashRoot()}>
+          {root => <RecoveryPanel cashRoot={root()} />}
+        </Show>
       </Show>
 
-      <Show when={run() && run()!.state !== 'done' && !touched()}>
+      <Show when={run() && !isRunComplete(run()!) && !touched()}>
         <ResumeBanner
           run={run()!}
           onResume={resumeFromBanner}
@@ -234,13 +274,15 @@ const App = () => {
         </section>
       </Show>
 
-      <Show when={run() && (run()!.state === 'done' || touched())}>
+      <Show when={run() && (isRunComplete(run()!) || touched())}>
         <RunView
           run={run()!}
           onRetry={retry}
           onDownload={download}
           onDownloadCsv={downloadCsv}
-          onStartNew={startNew}
+          onForget={startNew}
+          onRotate={rotateTicket}
+          cashRoot={cashRoot()}
           retrying={retrying()}
         />
       </Show>

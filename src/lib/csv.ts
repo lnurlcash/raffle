@@ -2,6 +2,7 @@
 // separate from the PDF, which is what gets cut up and given away. Anyone
 // holding this file holds every printed ticket's bearer secret, same as the
 // PDF does: treat it with the same care.
+import {toBech32Lnurl} from 'lnurlcash-kit'
 import type {TicketRecord} from './storage'
 
 const CSV_HEADER = ['ticket', 'sat', 'label', 'signed', 'note'] as const
@@ -16,17 +17,23 @@ const ticketRow = (t: TicketRecord, label: string): string[] => [
   String(Math.floor(t.amountMsat / 1000)),
   t.label,
   t.verified ? 'yes' : 'no',
-  t.noteUrl
+  // bech32 (LNURL1...) rather than the raw URL - same encoding the printed
+  // QR codes carry, so a note here matches what scanning a ticket produces
+  t.noteUrl ? toBech32Lnurl(t.noteUrl) : ''
 ]
 
 export const ticketsToCsv = (
   tickets: TicketRecord[],
-  leftover?: TicketRecord | null
+  leftover?: TicketRecord | null,
+  feesMsat?: number | null
 ): string => {
   const rows: string[][] = [[...CSV_HEADER]]
   for (const t of [...tickets].sort((a, b) => a.index - b.index)) {
     rows.push(ticketRow(t, String(t.index + 1)))
   }
   if (leftover) rows.push(ticketRow(leftover, 'leftover'))
+  if (feesMsat !== null && feesMsat !== undefined) {
+    rows.push(['fees', String(Math.floor(feesMsat / 1000)), '', '', ''])
+  }
   return rows.map(row => row.map(escapeCsvField).join(',')).join('\r\n')
 }

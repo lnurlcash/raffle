@@ -76,30 +76,9 @@ const drawQr = (
   }
 }
 
-// greedily wraps a string into lines no wider than maxWidth at this font/size
-const wrapMonospace = (
-  text: string,
-  font: PDFFont,
-  size: number,
-  maxWidth: number
-): string[] => {
-  const lines: string[] = []
-  let line = ''
-  for (const ch of text) {
-    const candidate = line + ch
-    if (line && font.widthOfTextAtSize(candidate, size) > maxWidth) {
-      lines.push(line)
-      line = ch
-    } else {
-      line = candidate
-    }
-  }
-  if (line) lines.push(line)
-  return lines
-}
-
-// same idea as wrapMonospace, but breaks at word boundaries - for prose,
-// where a mid-word break would be unreadable
+// wraps a string into lines no wider than maxWidth at this font/size,
+// breaking at word boundaries - for prose, where a mid-word break would be
+// unreadable
 const wrapWords = (
   text: string,
   font: PDFFont,
@@ -275,7 +254,6 @@ export const generateLotteryPdf = async (
   const doc = await PDFDocument.create()
   const font = await doc.embedFont(StandardFonts.Helvetica)
   const boldFont = await doc.embedFont(StandardFonts.HelveticaBold)
-  const monoFont = await doc.embedFont(StandardFonts.Courier)
 
   const [pageWidthMm, pageHeightMm] = PAGE_SIZE_MM[config.paper]
   const pageWidth = pageWidthMm * MM
@@ -402,21 +380,6 @@ export const generateLotteryPdf = async (
         font,
         color: rgb(0.6, 0.3, 0)
       })
-    }
-
-    cursorY -= 3.3 * MM
-    const noteLines = wrapMonospace(
-      preview
-        ? '(no note yet - appears after splitting)'
-        : toBech32Lnurl(ticket.noteUrl),
-      monoFont,
-      4.2,
-      textWidth
-    )
-    for (const line of noteLines) {
-      if (cursorY < bottom + padding) break
-      p.drawText(line, {x: textX, y: cursorY, size: 4.2, font: monoFont})
-      cursorY -= 2.1 * MM
     }
 
     cardOnPage++

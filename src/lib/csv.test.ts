@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest'
+import {toBech32Lnurl} from 'lnurlcash-kit'
 import {ticketsToCsv} from './csv'
 import type {TicketRecord} from './storage'
 
@@ -30,8 +31,23 @@ describe('ticketsToCsv', () => {
       ticket(1, {amountMsat: 500000, verified: false})
     ])
     const [, row1, row2] = csv.split('\r\n')
-    expect(row1).toBe('1,21000,,yes,https://mint.example/w?k1=0')
-    expect(row2).toBe('2,500,,no,https://mint.example/w?k1=1')
+    expect(row1).toBe(`1,21000,,yes,${toBech32Lnurl(ticket(0).noteUrl)}`)
+    expect(row2).toBe(`2,500,,no,${toBech32Lnurl(ticket(1).noteUrl)}`)
+  })
+
+  it('encodes the note as bech32 (LNURL1...), not the raw URL - matching what the printed QR carries', () => {
+    const csv = ticketsToCsv([ticket(0)])
+    const [, row1] = csv.split('\r\n')
+    const note = row1!.split(',').at(-1)!
+    expect(note).toMatch(/^LNURL1/)
+    expect(note).not.toContain('https://')
+    expect(note).toBe(toBech32Lnurl(ticket(0).noteUrl))
+  })
+
+  it('leaves the note column blank for a ticket with no note URL', () => {
+    const csv = ticketsToCsv([ticket(0, {noteUrl: ''})])
+    const [, row1] = csv.split('\r\n')
+    expect(row1).toBe('1,500,,yes,')
   })
 
   it('quotes fields containing commas or quotes, doubling embedded quotes', () => {
@@ -45,15 +61,37 @@ describe('ticketsToCsv', () => {
   })
 
   it('appends a leftover row when given one', () => {
-    const csv = ticketsToCsv([ticket(0)], ticket(-1, {label: 'unallocated'}))
+    const leftover = ticket(-1, {label: 'unallocated'})
+    const csv = ticketsToCsv([ticket(0)], leftover)
     const lines = csv.split('\r\n')
     expect(lines.at(-1)).toBe(
-      'leftover,500,unallocated,yes,https://mint.example/w?k1=-1'
+      `leftover,500,unallocated,yes,${toBech32Lnurl(leftover.noteUrl)}`
     )
   })
 
   it('omits the leftover row when there is none', () => {
     const csv = ticketsToCsv([ticket(0)], null)
     expect(csv.split('\r\n')).toHaveLength(2)
+  })
+
+  it('appends a fees row when a fee figure is known, converting msat to sat', () => {
+    const csv = ticketsToCsv([ticket(0)], null, 274_000)
+    expect(csv.split('\r\n').at(-1)).toBe('fees,274,,,')
+  })
+
+  it('omits the fees row when the figure is null or unset', () => {
+    expect(ticketsToCsv([ticket(0)], null, null).split('\r\n')).toHaveLength(2)
+    expect(ticketsToCsv([ticket(0)]).split('\r\n')).toHaveLength(2)
+  })
+
+  it('includes both leftover and fees rows together', () => {
+    const leftover = ticket(-1, {label: 'unallocated'})
+    const csv = ticketsToCsv([ticket(0)], leftover, 1000)
+    const lines = csv.split('\r\n')
+    expect(lines).toHaveLength(4)
+    expect(lines[2]).toBe(
+      `leftover,500,unallocated,yes,${toBech32Lnurl(leftover.noteUrl)}`
+    )
+    expect(lines[3]).toBe('fees,1,,,')
   })
 })

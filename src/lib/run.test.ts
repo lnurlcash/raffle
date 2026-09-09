@@ -15,9 +15,10 @@ import {
   cashSecretAt,
   deriveCashDomainNode,
   hashK1,
-  noteSignatureDigestForHash
+  noteSignatureDigestForHash,
+  splitNote
 } from 'lnurlcash-kit'
-import {startRun} from './run'
+import {startRun, resumeRun, rotateTicketRecord} from './run'
 import {defaultConfig, emptyTier} from './lottery'
 import {cashRootFromPhrase, generateSeedPhrase, nextIndexFor} from './seed'
 import type {PersistedRun} from './storage'
@@ -72,7 +73,8 @@ const createMockMint = (
   mintPubkey: string,
   initialK1: string,
   initialAmountMsat: number,
-  feePerSplitMsat = 0
+  feePerSplitMsat = 0,
+  refuseRotate = false
 ) => {
   const notes = new Map<string, {amountMsat: number; spent: boolean}>()
   const committed = new Map<string, number>() // hash -> amountMsat
@@ -88,6 +90,13 @@ const createMockMint = (
     notes.set(k1, {amountMsat, spent: false})
   }
 
+  // names a callback unique to whatever it's keyed by (a hash for a by-hash
+  // lookup, a raw k1 for a by-k1 one) rather than the fixed MINT_URL every
+  // other response uses - a mint whose callback legitimately varies by
+  // lookup kind, which is exactly what exposes a caller that carries one
+  // note's (or one lookup kind's) callback forward for a different note.
+  const callbackFor = (key: string) => `${MINT_URL}?note=${key}`
+
   const fetchMock = (async (input: string | URL) => {
     const url = new URL(input.toString())
     calls.push(url.toString())
@@ -99,12 +108,12 @@ const createMockMint = (
     if (!k1) {
       if (!h) return jsonResponse({status: 'ERROR', reason: 'missing k1'})
       // hash-only lookup: check both a note already revealed by some other
-      // request, and one only ever committed-by-hash so far
+      // request, and one only ever committed-by-hash so far.
       for (const [noteK1, note] of notes) {
         if (!note.spent && hashK1(noteK1) === h) {
           return jsonResponse({
             tag: 'withdrawRequest',
-            callback: MINT_URL,
+            callback: callbackFor(h),
             minWithdrawable: 0,
             maxWithdrawable: note.amountMsat,
             mintPubkey
@@ -115,7 +124,7 @@ const createMockMint = (
       if (committedAmount !== undefined) {
         return jsonResponse({
           tag: 'withdrawRequest',
-          callback: MINT_URL,
+          callback: callbackFor(h),
           minWithdrawable: 0,
           maxWithdrawable: committedAmount,
           mintPubkey
@@ -129,9 +138,9 @@ const createMockMint = (
       return jsonResponse({status: 'ERROR', reason: 'Unknown note.'})
     }
 
-    if (h) {
+    if (h && h2) {
       const amountMsat = Number(params.get('amount'))
-      if (!h2 || !Number.isFinite(amountMsat) || amountMsat > note.amountMsat) {
+      if (!Number.isFinite(amountMsat) || amountMsat > note.amountMsat) {
         return jsonResponse({status: 'ERROR', reason: 'invalid split request'})
       }
       note.spent = true
@@ -145,9 +154,30 @@ const createMockMint = (
       })
     }
 
+    if (h) {
+      if (refuseRotate) {
+        // an outright refusal: nothing committed, nothing burned - the
+        // note this mock started with is still exactly as it was
+        return jsonResponse({status: 'ERROR', reason: 'rotate not allowed'})
+      }
+      // rotate: burns k1, mints a fresh note of the same value under h
+      note.spent = true
+      committed.set(h, note.amountMsat)
+      return jsonResponse({
+        status: 'OK',
+        sig: sign(privateKey, h, note.amountMsat)
+      })
+    }
+
+    // by-k1 informational lookup: also names a callback unique to this
+    // note (`?note=<k1>`, distinct from the by-hash form's `?note=<hash>`
+    // above) rather than the fixed MINT_URL - this mint hands back a
+    // different callback depending on how a note was looked up, which is
+    // exactly what exposed a ticket wrongly carrying the change output's
+    // by-hash callback instead of confirming its own by k1.
     return jsonResponse({
       tag: 'withdrawRequest',
-      callback: MINT_URL,
+      callback: callbackFor(k1),
       k1,
       minWithdrawable: 0,
       maxWithdrawable: note.amountMsat,
@@ -204,13 +234,74 @@ describe('startRun against a mock mint', () => {
     ])
     expect(final.leftover?.amountMsat).toBe(100_000 - 50_000 - 30_000)
 
-    // the fixed bug's whole point: one informational GET to start, one mint
-    // call per ticket - never the settle-triggered rotate pair (an extra
-    // GET + rotate) that used to follow every split - plus one hash-only
-    // lookup at the very end to confirm the leftover's real value/fees
-    expect(mint.calls).toHaveLength(4)
+    // the fixed bug's whole point: one informational GET to start, then per
+    // ticket exactly one split call plus one hash-only confirmation lookup
+    // for its change (never the settle-triggered rotate pair - an extra
+    // mutation - that used to follow every split)
+    expect(mint.calls).toHaveLength(5)
     expect(final.usesSeed).toBe(false)
     expect(final.feesMsat).toBe(0)
+
+    // a Solid (or any Object.is-equality) signal setter must see a distinct
+    // reference on every call to reliably re-render - run.ts mutates one
+    // working object internally, so onUpdate must never be handed that same
+    // reference twice, or a UI subscriber can miss updates (this is exactly
+    // what caused a finished run to show stale progress with no buttons)
+    const references = new Set(runs)
+    expect(references.size).toBe(runs.length)
+  })
+
+  it("keeps every ticket, change and leftover on the note's own original callback, never a response-reported one", async () => {
+    // regression: run.ts used to trust whatever `callback` field a mint's
+    // response reported - whether from a by-hash lookup confirming a
+    // change output's value, or a by-k1 lookup on a ticket itself - and
+    // store that as a note's address. A callback in a response body is
+    // that request's own target, not a durable note identity; this mint
+    // hands back a distinct, marker-bearing callback for every such lookup
+    // (see callbackFor) specifically so a caller that ever adopts one gets
+    // caught here. Every output must carry the same bare callback the run
+    // started with (see noteCallback/startRun) instead.
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [
+        {...emptyTier(), count: 1, amountSat: 50, label: ''},
+        {...emptyTier(), count: 1, amountSat: 30, label: ''}
+      ]
+    }
+
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+
+    const final = runs.at(-1)!
+    const byIndex = [...final.tickets].sort((a, b) => a.index - b.index)
+    const callbackOf = (noteUrl: string) => {
+      const u = new URL(noteUrl)
+      u.searchParams.delete('k1')
+      u.searchParams.delete('amount')
+      u.searchParams.delete('sig')
+      return u.toString()
+    }
+
+    expect(callbackOf(byIndex[0]!.noteUrl)).toBe(MINT_URL)
+    expect(callbackOf(byIndex[1]!.noteUrl)).toBe(MINT_URL)
+    expect(callbackOf(final.leftover!.noteUrl)).toBe(MINT_URL)
   })
 
   it('calculates total mint fees as the gap between nominal and authoritative leftover value', async () => {
@@ -307,5 +398,267 @@ describe('startRun against a mock mint', () => {
 
     // two splits * two draws each - persisted durably, not just in memory
     expect(nextIndexFor(host)).toBe(4)
+  })
+
+  it('finishes the last ticket with whatever is actually left when fees eat the margin', async () => {
+    // mirrors a real report: 3 tickets configured at 30 sat each against a
+    // 90 sat note (zero margin), a mint that takes 1 sat per split - by the
+    // third ticket there's only 28 sat left, exactly the "amount must be
+    // between 0 and 28000 msat" shape that used to strand the run
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 90_000
+    const feePerSplitMsat = 1_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat,
+      feePerSplitMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [{...emptyTier(), count: 3, amountSat: 30, label: ''}]
+    }
+
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+
+    const final = runs.at(-1)!
+    expect(final.state).toBe('done')
+    expect(final.tickets).toHaveLength(3)
+    expect(final.leftover).toBeNull()
+    const amounts = final.tickets
+      .sort((a, b) => a.index - b.index)
+      .map(t => t.amountMsat)
+    expect(amounts[0]).toBe(30_000)
+    expect(amounts[1]).toBe(30_000)
+    expect(amounts[2]).toBe(90_000 - 30_000 - 1_000 - 30_000 - 1_000) // 28_000
+    expect(final.tickets.every(t => t.verified)).toBe(true)
+    expect(final.message).toMatch(/reduced/i)
+  })
+
+  it('recovers a stuck run whose stale balance only fails once the mint actually rejects it', async () => {
+    // simulates resuming a run persisted before this app tracked fees
+    // accurately after every split: `current.amountMsat` still claims more
+    // than is really there, so the proactive check waves it through and
+    // only the mint's own refusal (the reactive path in handleMutationError)
+    // catches the shortfall - same real-world report, one split further in
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 90_000
+    const feePerSplitMsat = 1_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat,
+      feePerSplitMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    // perform the first two splits directly against the mock (bypassing
+    // run.ts) to reach the exact same mint-side state a real prior session
+    // would have left behind, with two genuine tickets already minted
+    const split1 = await splitNote(MINT_URL, [initialK1], 30_000)
+    const split2 = await splitNote(MINT_URL, [split1.change], 30_000)
+    // real balance on split2.change is 90_000 - 30_000 - 1_000 - 30_000 -
+    // 1_000 = 28_000, but this run's persisted bookkeeping (from before fee
+    // tracking) still claims the full nominal 30_000 was left
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [{...emptyTier(), count: 3, amountSat: 30, label: ''}]
+    }
+    const staleRun: PersistedRun = {
+      id: 'stale',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      config,
+      mintPubkey,
+      noteCallback: MINT_URL,
+      plan: [
+        {index: 0, amountMsat: 30_000, label: ''},
+        {index: 1, amountMsat: 30_000, label: ''},
+        {index: 2, amountMsat: 30_000, label: ''}
+      ],
+      tickets: [
+        {
+          index: 0,
+          amountMsat: 30_000,
+          label: '',
+          noteUrl: `${MINT_URL}?k1=${split1.k1}&amount=30000`,
+          verified: true
+        },
+        {
+          index: 1,
+          amountMsat: 30_000,
+          label: '',
+          noteUrl: `${MINT_URL}?k1=${split2.k1}&amount=30000`,
+          verified: true
+        }
+      ],
+      current: {
+        k1: split2.change,
+        amountMsat: 30_000, // stale - really 28_000
+        signature: split2.changeSignature,
+        callback: MINT_URL
+      },
+      pending: null,
+      pendingKind: null,
+      state: 'error',
+      message: 'amount must be between 0 and 28000 msat.',
+      leftover: null,
+      feesMsat: null,
+      usesSeed: false
+    }
+
+    const runs: PersistedRun[] = []
+    await resumeRun(staleRun, run => runs.push(run))
+
+    const final = runs.at(-1)!
+    expect(final.state).toBe('done')
+    expect(final.tickets).toHaveLength(3)
+    expect(final.tickets.find(t => t.index === 2)?.amountMsat).toBe(28_000)
+    expect(final.message).toMatch(/reduced/i)
+  })
+
+  it('rotateTicketRecord refreshes a ticket to a new k1/signature at the same value', async () => {
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [{...emptyTier(), count: 1, amountSat: 100, label: ''}]
+    }
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+    const original = runs.at(-1)!.tickets[0]!
+    expect(original.verified).toBe(true)
+
+    const originalK1 = new URL(original.noteUrl).searchParams.get('k1')
+    const rotated = await rotateTicketRecord(original, mintPubkey)
+
+    expect(rotated.amountMsat).toBe(original.amountMsat)
+    expect(rotated.verified).toBe(true)
+    expect(rotated.index).toBe(original.index)
+    const rotatedK1 = new URL(rotated.noteUrl).searchParams.get('k1')
+    expect(rotatedK1).not.toBe(originalK1)
+
+    // the old secret is burned - a lookup on it now fails
+    await expect(
+      mint
+        .fetchMock(`${MINT_URL}?h=${hashK1(originalK1!)}`)
+        .then(r => r.json())
+        .then(b => {
+          if (b.status === 'ERROR') throw new Error(b.reason)
+        })
+    ).rejects.toThrow()
+  })
+
+  it("rotateTicketRecord keeps the ticket's own callback, never settleNote's reported one", async () => {
+    // regression: rotateTicketRecord used to store settled.callback (the
+    // response's own field, sourced from whichever kind of lookup settleNote
+    // happened to make) as the rotated note's address. A rotate only ever
+    // changes k1/signature/value - the note's own callback (see
+    // noteCallback) must survive untouched, even though this mock's
+    // by-k1 response reports a different, marker-bearing callback.
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [{...emptyTier(), count: 1, amountSat: 100, label: ''}]
+    }
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+    const original = runs.at(-1)!.tickets[0]!
+
+    const rotated = await rotateTicketRecord(original, mintPubkey)
+
+    const callbackOf = (noteUrl: string) => {
+      const u = new URL(noteUrl)
+      u.searchParams.delete('k1')
+      u.searchParams.delete('amount')
+      u.searchParams.delete('sig')
+      return u.toString()
+    }
+    expect(callbackOf(rotated.noteUrl)).toBe(MINT_URL)
+  })
+
+  it('rotateTicketRecord throws instead of accepting a refused rotate as if it succeeded', async () => {
+    // regression: settleNote falls back to returning the note exactly as
+    // it was - same k1, same signature - when the mint refuses a rotate
+    // outright (nothing burned, nothing landed). Treating that as a
+    // successful rotation silently produced a "rotated" ticket identical
+    // to the one before it - this should surface as a clear error instead.
+    const privateKey = secp256k1.utils.randomSecretKey()
+    const mintPubkey = bytesToHex(secp256k1.getPublicKey(privateKey, true))
+    const initialK1 = randomHex32()
+    const initialAmountMsat = 100_000
+
+    const mint = createMockMint(
+      privateKey,
+      mintPubkey,
+      initialK1,
+      initialAmountMsat,
+      0,
+      true // refuseRotate
+    )
+    vi.stubGlobal('fetch', mint.fetchMock)
+
+    const config = {
+      ...defaultConfig(),
+      tiers: [{...emptyTier(), count: 1, amountSat: 100, label: ''}]
+    }
+    const runs: PersistedRun[] = []
+    await startRun(
+      `${MINT_URL}?k1=${initialK1}&amount=${initialAmountMsat}`,
+      config,
+      run => runs.push(run)
+    )
+    const original = runs.at(-1)!.tickets[0]!
+
+    await expect(rotateTicketRecord(original, mintPubkey)).rejects.toThrow(
+      /refused/i
+    )
   })
 })
