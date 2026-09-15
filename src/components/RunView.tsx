@@ -1,5 +1,5 @@
 import {createSignal, For, Show} from 'solid-js'
-import {toBech32Lnurl, type CashNode} from 'lnurlcash-kit'
+import {toBech32Lnurl} from '@lnurlcash/kit'
 import {
   hasUnresolvedFunds,
   type PersistedRun,
@@ -14,7 +14,6 @@ type Props = {
   onDownloadCsv: () => void
   onForget: () => void
   onRotate: (index: number) => Promise<void>
-  cashRoot: CashNode | null
   retrying: boolean
 }
 
@@ -284,7 +283,7 @@ const RunView = (props: Props) => {
       </table>
 
       <Show when={allMinted()}>
-        <DangerZone tickets={dangerZoneTickets()} cashRoot={props.cashRoot} />
+        <DangerZone tickets={dangerZoneTickets()} />
       </Show>
     </div>
   )

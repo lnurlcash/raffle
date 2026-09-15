@@ -1,13 +1,14 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {cashSecretAt, deriveCashDomainNode} from 'lnurlcash-kit'
+import {deriveNoteSecretKey, encodeCk1, signNoteOwnership} from '@lnurlcash/kit'
 import {
+  branchFor,
   cashRootFromPhrase,
   clearCashRoot,
-  createPersistentRandomSecret,
   generateSeedPhrase,
   hasCashRoot,
   isValidSeedPhrase,
   loadCashRoot,
+  nextCk1For,
   nextIndexFor,
   raiseIndexFor,
   saveCashRoot
@@ -52,12 +53,8 @@ describe('cashRootFromPhrase', () => {
     const rootA1 = cashRootFromPhrase(phraseA)
     const rootA2 = cashRootFromPhrase(phraseA)
     const rootB = cashRootFromPhrase(phraseB)
-    expect(Buffer.from(rootA1.privateKey)).toEqual(
-      Buffer.from(rootA2.privateKey)
-    )
-    expect(Buffer.from(rootA1.privateKey)).not.toEqual(
-      Buffer.from(rootB.privateKey)
-    )
+    expect(Buffer.from(rootA1)).toEqual(Buffer.from(rootA2))
+    expect(Buffer.from(rootA1)).not.toEqual(Buffer.from(rootB))
   })
 })
 
@@ -71,10 +68,19 @@ describe('cash root storage', () => {
     expect(hasCashRoot()).toBe(true)
     const loaded = loadCashRoot()
     expect(loaded).not.toBeNull()
-    expect(Buffer.from(loaded!.privateKey)).toEqual(
-      Buffer.from(root.privateKey)
+    expect(Buffer.from(loaded!)).toEqual(Buffer.from(root))
+  })
+
+  it('treats a differently-tagged (or untagged) stored value as no seed active', () => {
+    // guards against a root saved by a future/incompatible derivation
+    // scheme being silently reinterpreted as this one's seed bytes - see
+    // seed.ts's ROOT_SCHEME comment
+    localStorage.setItem(
+      'lnurlcash-lottery:cash-root',
+      JSON.stringify({scheme: 'some-other-scheme', seedHex: '00'.repeat(64)})
     )
-    expect(Buffer.from(loaded!.chainCode)).toEqual(Buffer.from(root.chainCode))
+    expect(hasCashRoot()).toBe(true)
+    expect(loadCashRoot()).toBeNull()
   })
 
   it('clearCashRoot removes the root and every per-host counter', () => {
@@ -107,38 +113,41 @@ describe('per-host index counters', () => {
   })
 })
 
-describe('createPersistentRandomSecret', () => {
+describe('nextCk1For', () => {
   it("matches the kit's own per-index derivation", () => {
     const root = cashRootFromPhrase(generateSeedPhrase())
     const host = 'mint.example'
-    const domainNode = deriveCashDomainNode(root, host)
-    const draw = createPersistentRandomSecret(root, host)
-    expect(draw()).toBe(cashSecretAt(domainNode, 0))
-    expect(draw()).toBe(cashSecretAt(domainNode, 1))
+    const branch = branchFor(root, host)
+    const expectedAt = (index: number) =>
+      encodeCk1(
+        signNoteOwnership(
+          deriveNoteSecretKey(branch.privateKey, branch.chainCode, index)
+        )
+      )
+    expect(nextCk1For(root, host)).toBe(expectedAt(0))
+    expect(nextCk1For(root, host)).toBe(expectedAt(1))
   })
 
   it('persists the counter on every draw, before the caller does anything else', () => {
     const root = cashRootFromPhrase(generateSeedPhrase())
     const host = 'mint.example'
-    const draw = createPersistentRandomSecret(root, host)
     expect(nextIndexFor(host)).toBe(0)
-    draw()
+    nextCk1For(root, host)
     expect(nextIndexFor(host)).toBe(1)
-    draw()
+    nextCk1For(root, host)
     expect(nextIndexFor(host)).toBe(2)
   })
 
-  it('resumes from the persisted index on a fresh call, never replaying one', () => {
+  it('never repeats an index across calls, and resumes from the persisted one after a simulated reload', () => {
     const root = cashRootFromPhrase(generateSeedPhrase())
     const host = 'mint.example'
-    const first = createPersistentRandomSecret(root, host)
-    const a = first()
-    const b = first()
+    const a = nextCk1For(root, host)
+    const b = nextCk1For(root, host)
 
-    // simulate a page reload: a brand new source built from the same
-    // (persisted) starting point must continue, not restart at 0
-    const resumed = createPersistentRandomSecret(root, host)
-    const c = resumed()
+    // nextCk1For reads nextIndexFor fresh every call rather than holding
+    // its own counter, so there's nothing to reconstruct after a simulated
+    // reload - the next call already continues from the persisted index
+    const c = nextCk1For(root, host)
     expect(c).not.toBe(a)
     expect(c).not.toBe(b)
     expect(nextIndexFor(host)).toBe(3)

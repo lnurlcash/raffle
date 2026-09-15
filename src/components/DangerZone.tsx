@@ -1,17 +1,15 @@
 import {createSignal, Show} from 'solid-js'
-import {serverOf, toBech32Lnurl, type CashNode} from 'lnurlcash-kit'
+import {toBech32Lnurl} from '@lnurlcash/kit'
 import {
   checkTicketsLive,
   combineNotes,
   type CombinedNote,
   type TicketLiveness
 } from '../lib/recovery'
-import {createPersistentRandomSecret} from '../lib/seed'
 import type {TicketRecord} from '../lib/storage'
 
 type Props = {
   tickets: TicketRecord[]
-  cashRoot: CashNode | null
 }
 
 const DangerZone = (props: Props) => {
@@ -57,16 +55,9 @@ const DangerZone = (props: Props) => {
       // any live ticket's own noteUrl carries the right origin/path to
       // merge against - callback is otherwise mint-wide, not per-note
       const anyTicket = props.tickets.find(t => t.index === live[0]!.index)!
-      const randomSecret = props.cashRoot
-        ? createPersistentRandomSecret(
-            props.cashRoot,
-            serverOf(anyTicket.noteUrl)
-          )
-        : undefined
       const result = await combineNotes(
         anyTicket.noteUrl,
-        live.map(l => l.k1),
-        randomSecret
+        live.map(l => l.k1)
       )
       setCombined(result)
       setLiveness(null)

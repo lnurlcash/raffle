@@ -2,30 +2,28 @@
 // one splitNote call per ticket. Every step is persisted (see storage.ts)
 // before this function does anything else with the result, because every
 // step here can move real money and a dropped connection does not mean
-// nothing happened - see lnurlcash-kit's README, "The five things that will
-// cost you money". Read that before changing this file.
+// nothing happened - see @lnurlcash/kit's THREAT-MODEL.md and its
+// AmbiguousMutationError docs. Read those before changing this file.
 import {
   resolveNoteInput,
   fetchNoteInfo,
   fetchNoteInfoByHash,
+  fetchNoteInfoByPubkey,
   hashK1,
   splitNote,
-  settleNote,
+  rotateNote,
   buildNoteUrl,
   withNewK1,
   requireNoteK1,
-  noteSignature,
   verifyNoteSignature,
   probeBurnedNote,
-  newSecretsOf,
-  serverOf,
-  AmbiguousMintError,
-  PendingNoteError,
-  type CashNode,
-  type RandomSecret
-} from 'lnurlcash-kit'
+  isCk1,
+  cp1FromCk1,
+  AmbiguousMutationError,
+  PendingNoteError
+} from '@lnurlcash/kit'
 import {planTickets, type LotteryConfig, type TicketPlan} from './lottery'
-import {createPersistentRandomSecret} from './seed'
+import type {CashRoot} from './seed'
 import {
   saveRun,
   type PersistedRun,
@@ -43,6 +41,21 @@ import {
 // some unrelated re-render, which is exactly how a finished run could show
 // stale progress with none of its action buttons. A shallow copy costs
 // nothing and guarantees every step is its own distinct, observable value.
+// A hash-only lookup is only a valid privacy-preserving check for a legacy
+// secret - a ck1 (Part 2 recoverable) secret is indexed by its mint by the
+// pubkey it discloses, not a hash of the signature itself, so hashK1(k1)
+// would look up nothing for one of those. See seed.ts's nextCk1For: any
+// output this app mints while a seed is active is a ck1, so both forms can
+// show up side by side in the same run.
+const fetchNoteInfoForK1 = (url: string, k1: string) => {
+  if (isCk1(k1)) {
+    const cp1 = cp1FromCk1(k1)
+    if (!cp1) throw new Error("This note's ck1 secret is malformed.")
+    return fetchNoteInfoByPubkey(url, cp1)
+  }
+  return fetchNoteInfoByHash(url, hashK1(k1))
+}
+
 const emit = (run: PersistedRun, onUpdate: (run: PersistedRun) => void) => {
   saveRun(run)
   onUpdate({...run})
@@ -81,16 +94,17 @@ const failWith = (
 }
 
 // The ordinary happy path: splitNote already resolved, so both outputs
-// already carry a mint-issued signature (its requireSignatures default
-// throws UnverifiableNoteError otherwise - see foldRecoveredOutputs for
-// that case), and the ticket's own value is exact - LUD-25 mints the h
-// output at precisely the amount requested. The h2/change side is the one
-// place a mint-charged split fee can hide, and trusting a nominal estimate
-// for it (payout minus the ticket) let that estimate drift from what the
-// mint actually left behind - silently, until a later split asked for more
-// than was really there and failed. So every split confirms the change's
-// authoritative value with one hash-only lookup (no k1 disclosed, no
-// rotate, nothing mutated - not the extra mutation settleNote costs) before
+// already carry a mint-issued signature (splitNoteWithHash's
+// requireMutationSignature throws otherwise, wrapped into
+// AmbiguousMutationError - see foldRecoveredOutputs for that case), and the
+// ticket's own value is exact - LUD-25 mints the h output at precisely the
+// amount requested. The h2/change side is the one place a mint-charged
+// split fee can hide, and trusting a nominal estimate for it (payout minus
+// the ticket) let that estimate drift from what the mint actually left
+// behind - silently, until a later split asked for more than was really
+// there and failed. So every split confirms the change's authoritative
+// value with one hash/pubkey-only lookup (no k1 disclosed, no rotate,
+// nothing mutated - not the extra mutation rotateNote costs) before
 // `current` moves on to it. That lookup's own `callback` is what `current`
 // carries forward too: it's the live mutation target for the *next* split
 // or rotate, which this mint answers at a different endpoint than a plain
@@ -120,10 +134,7 @@ const foldSignedOutputs = async (
   let changeAmountMsat = nominalChangeAmountMsat
   let changeCallback = current.callback
   try {
-    const changeInfo = await fetchNoteInfoByHash(
-      current.callback,
-      hashK1(changeK1)
-    )
+    const changeInfo = await fetchNoteInfoForK1(current.callback, changeK1)
     changeAmountMsat = changeInfo.maxWithdrawable
     changeCallback = changeInfo.callback
     if (run.feesMsat !== null) {
@@ -165,64 +176,58 @@ const foldSignedOutputs = async (
 
 // The recovery path: all we have is two secrets this app generated, with no
 // signature - either the mint confirmed a split without signing it, or a
-// split whose fate was ambiguous turned out to have landed. Rotating each
-// one is the only way left to get an offline-verifiable signature (and,
-// incidentally, the change's authoritative value), which is exactly what
-// settleNote does - unlike the happy path above, that extra round trip is
-// the point here, not overhead to avoid.
+// split whose fate was ambiguous turned out to have landed. @lnurlcash/kit
+// no longer offers a "confirm or fetch a signature" settleNote - rotating
+// each one is the only way left to get an offline-verifiable signature (and
+// a fresh k1 along with it - see fetchNoteInfoForK1 for the authoritative
+// value that comes with it), which is exactly what rotateNote is for.
+// Unlike the happy path above, this extra round trip per output is the
+// point here, not overhead to avoid.
 const foldRecoveredOutputs = async (
   run: PersistedRun,
   ticket: TicketPlan,
   ticketK1: string,
-  changeK1: string,
-  randomSecret: RandomSecret | undefined
+  changeK1: string
 ): Promise<void> => {
   const current = run.current!
-  const options = randomSecret ? {randomSecret} : undefined
-  const ticketSettled = await settleNote(
+  const ticketRotated = await rotateNote(current.callback, ticketK1)
+  const ticketInfo = await fetchNoteInfoForK1(
     current.callback,
-    ticketK1,
-    ticket.amountMsat,
-    undefined,
-    options
+    ticketRotated.k1
   )
   const nominalChangeAmountMsat = current.amountMsat - ticket.amountMsat
-  const changeSettled = await settleNote(
+  const changeRotated = await rotateNote(current.callback, changeK1)
+  const changeInfo = await fetchNoteInfoForK1(
     current.callback,
-    changeK1,
-    nominalChangeAmountMsat,
-    undefined,
-    options
+    changeRotated.k1
   )
   if (run.feesMsat !== null) {
-    run.feesMsat += nominalChangeAmountMsat - changeSettled.amountMsat
+    run.feesMsat += nominalChangeAmountMsat - changeInfo.maxWithdrawable
   }
-  const verified = ticketSettled.signature
-    ? verifyNoteSignature(
-        ticketSettled.k1,
-        ticketSettled.amountMsat,
-        ticketSettled.signature,
-        run.mintPubkey
-      )
-    : false
+  const verified = verifyNoteSignature(
+    ticketRotated.k1,
+    ticketInfo.maxWithdrawable,
+    ticketRotated.signature,
+    run.mintPubkey
+  )
   const record: TicketRecord = {
     index: ticket.index,
-    amountMsat: ticketSettled.amountMsat,
+    amountMsat: ticketInfo.maxWithdrawable,
     label: ticket.label,
     noteUrl: noteUrlOf({
-      k1: ticketSettled.k1,
-      amountMsat: ticketSettled.amountMsat,
-      signature: verified ? ticketSettled.signature : undefined,
+      k1: ticketRotated.k1,
+      amountMsat: ticketInfo.maxWithdrawable,
+      signature: verified ? ticketRotated.signature : undefined,
       callback: run.noteCallback
     }),
     verified
   }
   run.tickets = [...run.tickets, record]
   run.current = {
-    k1: changeSettled.k1,
-    amountMsat: changeSettled.amountMsat,
-    signature: changeSettled.signature,
-    callback: changeSettled.callback
+    k1: changeRotated.k1,
+    amountMsat: changeInfo.maxWithdrawable,
+    signature: changeRotated.signature,
+    callback: changeInfo.callback
   }
   run.pending = null
   run.pendingKind = null
@@ -246,7 +251,7 @@ const finishWithRemainderAsFinalTicket = async (
   const current = run.current!
   let amountMsat = current.amountMsat
   try {
-    const info = await fetchNoteInfoByHash(current.callback, hashK1(current.k1))
+    const info = await fetchNoteInfoForK1(current.callback, current.k1)
     amountMsat = info.maxWithdrawable
   } catch {
     // couldn't refresh - fall back to whatever this run already believed
@@ -294,51 +299,24 @@ const finishWithRemainderAsFinalTicket = async (
 
 // A mutation whose success we cannot confirm. Every branch here either
 // stashes the fresh secrets this app generated (never invented by the
-// service - see lnurlcash-kit's rotate/split contract) before returning, or
+// service - see @lnurlcash/kit's rotate/split contract) before returning, or
 // determines definitively that nothing was lost.
 const handleMutationError = async (
   err: unknown,
   run: PersistedRun,
   ticket: TicketPlan,
   isLastTicket: boolean,
-  onUpdate: (run: PersistedRun) => void,
-  randomSecret: RandomSecret | undefined
+  onUpdate: (run: PersistedRun) => void
 ): Promise<void> => {
-  const secrets = newSecretsOf(err)
-  if (secrets.length === 2 && !(err instanceof AmbiguousMintError)) {
-    // The service confirmed OK but didn't sign the outputs - landed for
-    // certain, just unverifiable. Try to fold it in immediately; if that
-    // itself fails, the secrets are not lost - they sit in `pending` marked
-    // 'confirmed' so a later check retries only the settle, never a probe.
-    run.pending = [
-      {role: 'ticket', k1: secrets[0]!, nominalAmountMsat: ticket.amountMsat},
-      {
-        role: 'change',
-        k1: secrets[1]!,
-        nominalAmountMsat: run.current!.amountMsat - ticket.amountMsat
-      }
-    ]
-    run.pendingKind = 'confirmed'
-    emit(run, onUpdate)
-    try {
-      await foldRecoveredOutputs(
-        run,
-        ticket,
-        secrets[0]!,
-        secrets[1]!,
-        randomSecret
-      )
-      run.message =
-        'One ticket could not be offline-verified (the mint did not sign it), but the split did complete and the ticket is real.'
-      emit(run, onUpdate)
-    } catch (settleErr) {
-      run.state = 'needs-check'
-      run.message = `Split completed but could not be settled yet: ${(settleErr as Error).message}. Nothing is lost - use "check pending" to retry.`
-      emit(run, onUpdate)
-    }
-    return
-  }
-  if (err instanceof AmbiguousMintError) {
+  // @lnurlcash/kit no longer distinguishes "confirmed OK but unsigned" from
+  // "genuinely uncertain whether it landed" (the old package's separate
+  // UnverifiableNoteError is gone) - splitNote/rotateNote/mergeNotes wrap
+  // every such case in the same AmbiguousMutationError now, carrying
+  // whatever fresh secrets they minted. Always probe before settling
+  // (pendingKind 'ambiguous') rather than assuming success, since there's
+  // no longer a way to tell the two cases apart up front.
+  if (err instanceof AmbiguousMutationError) {
+    const secrets = err.newSecrets
     run.pending = [
       {role: 'ticket', k1: secrets[0]!, nominalAmountMsat: ticket.amountMsat},
       {
@@ -349,7 +327,7 @@ const handleMutationError = async (
     ]
     run.pendingKind = 'ambiguous'
     run.state = 'needs-check'
-    run.message = (err as Error).message
+    run.message = err.message
     emit(run, onUpdate)
     return
   }
@@ -377,8 +355,7 @@ const handleMutationError = async (
 export const resolvePending = async (
   run: PersistedRun,
   ticket: TicketPlan,
-  onUpdate: (run: PersistedRun) => void,
-  randomSecret: RandomSecret | undefined
+  onUpdate: (run: PersistedRun) => void
 ): Promise<boolean> => {
   if (!run.pending || !run.current) return true
   const [ticketPending, changePending] = run.pending
@@ -407,8 +384,7 @@ export const resolvePending = async (
       run,
       ticket,
       ticketPending!.k1,
-      changePending!.k1,
-      randomSecret
+      changePending!.k1
     )
     run.state = 'running'
     run.message = null
@@ -427,24 +403,14 @@ export const resolvePending = async (
 // unprinted leftover note.
 const continueRun = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void,
-  cashRoot: CashNode | null
+  onUpdate: (run: PersistedRun) => void
 ): Promise<void> => {
-  // built once per resume, from whatever host the note we're splitting is
-  // actually at - a run only ever touches one mint, so one source for its
-  // whole duration is correct even across a page reload (createPersistentRandomSecret
-  // resumes from the latest persisted index itself, see seed.ts)
-  const randomSecret =
-    cashRoot && run.current
-      ? createPersistentRandomSecret(cashRoot, serverOf(run.current.callback))
-      : undefined
-
   while (run.current && run.tickets.length < run.plan.length) {
     const ticket = run.plan[run.tickets.length]!
     const isLastTicket = run.tickets.length === run.plan.length - 1
 
     if (run.pending) {
-      const clear = await resolvePending(run, ticket, onUpdate, randomSecret)
+      const clear = await resolvePending(run, ticket, onUpdate)
       if (!clear) return
       continue
     }
@@ -473,8 +439,7 @@ const continueRun = async (
       const split = await splitNote(
         run.current.callback,
         [run.current.k1],
-        ticket.amountMsat,
-        randomSecret ? {randomSecret} : undefined
+        ticket.amountMsat
       )
       if (!split.signature || !split.changeSignature) {
         // shouldn't happen - splitNote's default requireSignatures throws
@@ -495,14 +460,7 @@ const continueRun = async (
       run.message = null
       emit(run, onUpdate)
     } catch (err) {
-      await handleMutationError(
-        err,
-        run,
-        ticket,
-        isLastTicket,
-        onUpdate,
-        randomSecret
-      )
+      await handleMutationError(err, run, ticket, isLastTicket, onUpdate)
       if (run.state !== 'running') return
     }
   }
@@ -538,7 +496,7 @@ export const startRun = async (
   noteInput: string,
   config: LotteryConfig,
   onUpdate: (run: PersistedRun) => void,
-  cashRoot: CashNode | null = null
+  cashRoot: CashRoot | null = null
 ): Promise<void> => {
   const url = resolveNoteInput(noteInput)
   if (!url) throw new Error('That is not a recognizable bearer note.')
@@ -578,94 +536,76 @@ export const startRun = async (
     usesSeed: cashRoot !== null
   }
   emit(run, onUpdate)
-  await continueRun(run, onUpdate, cashRoot)
+  await continueRun(run, onUpdate)
 }
 
 export const resumeRun = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void,
-  cashRoot: CashNode | null = null
+  onUpdate: (run: PersistedRun) => void
 ): Promise<void> => {
   run.state = 'running'
   emit(run, onUpdate)
-  await continueRun(run, onUpdate, cashRoot)
+  await continueRun(run, onUpdate)
 }
 
 // Manual retry for a run parked in 'needs-check' - re-probes/settles the
 // stashed pending secrets, and keeps splitting if that clears it.
 export const checkPending = async (
   run: PersistedRun,
-  onUpdate: (run: PersistedRun) => void,
-  cashRoot: CashNode | null = null
+  onUpdate: (run: PersistedRun) => void
 ): Promise<void> => {
-  await continueRun(run, onUpdate, cashRoot)
+  await continueRun(run, onUpdate)
 }
 
 // Refreshes one already-minted ticket (or the leftover) after the run
-// itself is done: confirms its authoritative value with an informational
-// lookup, then rotates it to obtain a fresh, offline-verifiable signature
-// for that confirmed amount - exactly what settleNote already does for the
-// mid-run recovery path. This is not part of splitting: it's for a ticket
-// the organizer is checking or taking back, and rotating BURNS whatever
-// secret is currently printed on it, minting a new one only the caller
-// learns - see the "danger zone" warning wherever this is wired into the
-// UI. Everything it needs (k1, callback, signature) already lives in the
-// ticket's own noteUrl, so no other run state is required to call it.
+// itself is done: rotates it to obtain a fresh, offline-verifiable
+// signature, then confirms its authoritative value with a follow-up
+// informational lookup (rotateNote itself doesn't report a value). This is
+// not part of splitting: it's for a ticket the organizer is checking or
+// taking back, and rotating BURNS whatever secret is currently printed on
+// it, minting a new one only the caller learns - see the "danger zone"
+// warning wherever this is wired into the UI. Everything it needs (k1,
+// callback) already lives in the ticket's own noteUrl, so no other run
+// state is required to call it.
 export const rotateTicketRecord = async (
   ticket: TicketRecord,
-  mintPubkey: string,
-  randomSecret?: RandomSecret
+  mintPubkey: string
 ): Promise<TicketRecord> => {
   const k1 = requireNoteK1(ticket.noteUrl)
-  const signature = noteSignature(ticket.noteUrl) ?? undefined
-  let settled
+  let rotated
   try {
-    settled = await settleNote(
-      ticket.noteUrl,
-      k1,
-      ticket.amountMsat,
-      signature,
-      randomSecret ? {randomSecret} : undefined
-    )
+    rotated = await rotateNote(ticket.noteUrl, k1)
   } catch (err) {
-    // settleNote throws (rather than falling back) exactly when the
-    // rotate's fate is ambiguous and it minted a fresh secret that might
-    // already be a live note - swallowing that here would lose it for
-    // good, so it's surfaced instead of ever silently discarded.
-    const secrets = newSecretsOf(err)
-    const detail = err instanceof Error ? err.message : String(err)
-    if (secrets.length > 0) {
+    if (err instanceof AmbiguousMutationError) {
+      // the rotate's fate is ambiguous and it minted a fresh secret that
+      // might already be a live note - swallowing that here would lose it
+      // for good, so it's surfaced instead of ever silently discarded.
       throw new Error(
-        `Rotate's outcome is unknown: ${detail} A new secret may already be a real note - do not discard it: ${secrets.join(', ')}`
+        `Rotate's outcome is unknown: ${err.message} A new secret may already be a real note - do not discard it: ${err.newSecrets.join(', ')}`
       )
     }
-    throw err
-  }
-  // settleNote falls back to returning the note exactly as it was - same
-  // k1, same signature - when the mint refuses the rotate outright and
-  // nothing was burned. Silently treating that as a successful rotation is
-  // what let a refused rotate through as if it had produced a fresh note.
-  if (settled.k1 === k1) {
+    // any other failure is a clean refusal - nothing committed, nothing
+    // burned, the ticket is exactly as it was before.
+    const detail = err instanceof Error ? err.message : String(err)
     throw new Error(
-      'The mint refused to rotate this note - nothing was changed, the ticket is exactly as it was before.'
+      `The mint refused to rotate this note: ${detail} Nothing was changed, the ticket is exactly as it was before.`
     )
   }
-  const verified = settled.signature
-    ? verifyNoteSignature(
-        settled.k1,
-        settled.amountMsat,
-        settled.signature,
-        mintPubkey
-      )
-    : false
+  const info = await fetchNoteInfoForK1(ticket.noteUrl, rotated.k1)
+  const verified = verifyNoteSignature(
+    rotated.k1,
+    info.maxWithdrawable,
+    rotated.signature,
+    mintPubkey
+  )
   return {
     ...ticket,
-    amountMsat: settled.amountMsat,
+    amountMsat: info.maxWithdrawable,
     noteUrl: noteUrlOf({
-      k1: settled.k1,
-      amountMsat: settled.amountMsat,
-      signature: verified ? settled.signature : undefined,
-      // never settled.callback (that's a live mutation target, not a
+      k1: rotated.k1,
+      amountMsat: info.maxWithdrawable,
+      signature: verified ? rotated.signature : undefined,
+      // never info.callback (that's a live mutation target, not a
       // printable address - see PersistedRun.noteCallback). The ticket's
       // own url already carries the note's stable address; a rotate only
       // ever changes its k1/signature/value, never where it lives.

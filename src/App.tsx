@@ -1,5 +1,4 @@
 import {createSignal, Show} from 'solid-js'
-import {serverOf, type CashNode} from 'lnurlcash-kit'
 import NoteInput, {type NoteBalance} from './components/NoteInput'
 import ConfigForm from './components/ConfigForm'
 import RunView from './components/RunView'
@@ -12,7 +11,7 @@ import {loadRun, saveRun, clearRun, type PersistedRun} from './lib/storage'
 import {startRun, resumeRun, rotateTicketRecord} from './lib/run'
 import {generateLotteryPdf, previewTickets} from './lib/pdf'
 import {ticketsToCsv} from './lib/csv'
-import {loadCashRoot, createPersistentRandomSecret} from './lib/seed'
+import {loadCashRoot, type CashRoot} from './lib/seed'
 
 const App = () => {
   const [run, setRun] = createSignal<PersistedRun | null>(loadRun())
@@ -29,7 +28,7 @@ const App = () => {
   const [starting, setStarting] = createSignal(false)
   const [startError, setStartError] = createSignal<string | null>(null)
   const [retrying, setRetrying] = createSignal(false)
-  const [cashRoot, setCashRoot] = createSignal<CashNode | null>(loadCashRoot())
+  const [cashRoot, setCashRoot] = createSignal<CashRoot | null>(loadCashRoot())
 
   // every planned ticket minted is what actually determines the run is
   // finished, same reasoning as RunView's own allMinted - relying on the
@@ -68,7 +67,7 @@ const App = () => {
     if (!current) return
     setRetrying(true)
     try {
-      await resumeRun(current, setRun, cashRoot())
+      await resumeRun(current, setRun)
     } finally {
       setRetrying(false)
     }
@@ -80,7 +79,7 @@ const App = () => {
     setTouched(true)
     setRetrying(true)
     try {
-      await resumeRun(current, setRun, cashRoot())
+      await resumeRun(current, setRun)
     } finally {
       setRetrying(false)
     }
@@ -146,14 +145,7 @@ const App = () => {
       ? current.leftover
       : current.tickets.find(t => t.index === index)
     if (!target) return
-    const randomSecret = cashRoot()
-      ? createPersistentRandomSecret(cashRoot()!, serverOf(target.noteUrl))
-      : undefined
-    const updated = await rotateTicketRecord(
-      target,
-      current.mintPubkey,
-      randomSecret
-    )
+    const updated = await rotateTicketRecord(target, current.mintPubkey)
     const nextRun: PersistedRun = isLeftover
       ? {...current, leftover: updated}
       : {
@@ -283,7 +275,6 @@ const App = () => {
           onDownloadCsv={downloadCsv}
           onForget={startNew}
           onRotate={rotateTicket}
-          cashRoot={cashRoot()}
           retrying={retrying()}
         />
       </Show>

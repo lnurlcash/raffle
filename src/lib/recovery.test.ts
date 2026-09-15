@@ -1,13 +1,32 @@
 import {describe, expect, it, vi} from 'vitest'
 import {secp256k1} from '@noble/curves/secp256k1.js'
-import {bytesToHex} from '@noble/hashes/utils.js'
-import {hashK1, noteSignatureDigestForHash} from 'lnurlcash-kit'
+import {sha256} from '@noble/hashes/sha2.js'
+import {bytesToHex, utf8ToBytes} from '@noble/hashes/utils.js'
+import {hashK1} from '@lnurlcash/kit'
 import {checkTicketsLive, combineNotes} from './recovery'
 
 const MINT_URL = 'https://mint.test/w'
 
 const randomHex32 = (): string =>
   bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
+
+// @lnurlcash/kit computes this internally (signature.ts) but doesn't export
+// it - it's the wire format LUD-25 mints sign over, so the mock mint below
+// needs to reproduce it exactly to hand back a signature the code under
+// test will actually verify.
+const LIGHTNING_SIGNED_MESSAGE_PREFIX = utf8ToBytes('Lightning Signed Message:')
+
+const noteSignatureDigestForHash = (
+  h: string,
+  amountMsat: number
+): Uint8Array => {
+  const message = utf8ToBytes(
+    `LNURLcash:${amountMsat}:${h.trim().toLowerCase()}`
+  )
+  return sha256(
+    sha256(new Uint8Array([...LIGHTNING_SIGNED_MESSAGE_PREFIX, ...message]))
+  )
+}
 
 const sign = (
   privateKey: Uint8Array,

@@ -1,5 +1,5 @@
 import {createSignal, For, Show} from 'solid-js'
-import {buildNoteUrl, serverOf, type CashNode} from 'lnurlcash-kit'
+import {buildNoteUrl} from '@lnurlcash/kit'
 import {
   combineNotes,
   scanForNotes,
@@ -7,10 +7,10 @@ import {
   type RecoveredNote,
   type ScanProgress
 } from '../lib/recovery'
-import {createPersistentRandomSecret} from '../lib/seed'
+import type {CashRoot} from '../lib/seed'
 
 type Props = {
-  cashRoot: CashNode
+  cashRoot: CashRoot
 }
 
 const RecoveryPanel = (props: Props) => {
@@ -57,12 +57,9 @@ const RecoveryPanel = (props: Props) => {
     setCombining(true)
     setCombineError(null)
     try {
-      const host = serverOf(mintUrl().trim())
-      const randomSecret = createPersistentRandomSecret(props.cashRoot, host)
       const result = await combineNotes(
         found[0]!.callback,
-        found.map(n => n.k1),
-        randomSecret
+        found.map(n => n.k1)
       )
       setCombined(result)
       setResults(null)
@@ -116,8 +113,8 @@ const RecoveryPanel = (props: Props) => {
 
       <Show when={scanning() && progress()}>
         <p class="hint">
-          Checking index {progress()!.index}… {progress()!.foundCount} found so
-          far.
+          Scanning… {progress()!.foundCount} found so far (last at index{' '}
+          {progress()!.index}).
         </p>
       </Show>
 

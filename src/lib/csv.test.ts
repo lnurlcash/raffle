@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest'
-import {toBech32Lnurl} from 'lnurlcash-kit'
+import {toBech32Lnurl} from '@lnurlcash/kit'
 import {ticketsToCsv} from './csv'
 import type {TicketRecord} from './storage'
 

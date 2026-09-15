@@ -1,5 +1,5 @@
 import {createSignal, Show} from 'solid-js'
-import {resolveNoteInput, fetchNoteInfo} from 'lnurlcash-kit'
+import {resolveNoteInput, fetchNoteInfo} from '@lnurlcash/kit'
 
 export type NoteBalance = {
   url: string

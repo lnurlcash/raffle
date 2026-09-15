@@ -3,15 +3,15 @@ import {
   generateSeedPhrase,
   isValidSeedPhrase,
   cashRootFromPhrase,
-  clearCashRoot
+  clearCashRoot,
+  type CashRoot
 } from '../lib/seed'
-import type {CashNode} from 'lnurlcash-kit'
 
 type Mode = 'idle' | 'generate' | 'restore'
 
 type Props = {
   active: boolean
-  onActivate: (root: CashNode) => void
+  onActivate: (root: CashRoot) => void
   onForget: () => void
 }
 

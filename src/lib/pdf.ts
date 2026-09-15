@@ -12,7 +12,7 @@ import {
   type PDFPage
 } from 'pdf-lib'
 import QRCode from 'qrcode'
-import {toBech32Lnurl} from 'lnurlcash-kit'
+import {toBech32Lnurl} from '@lnurlcash/kit'
 import {
   planTickets,
   ticketCount,

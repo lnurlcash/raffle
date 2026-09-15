@@ -2,7 +2,7 @@
 // separate from the PDF, which is what gets cut up and given away. Anyone
 // holding this file holds every printed ticket's bearer secret, same as the
 // PDF does: treat it with the same care.
-import {toBech32Lnurl} from 'lnurlcash-kit'
+import {toBech32Lnurl} from '@lnurlcash/kit'
 import type {TicketRecord} from './storage'
 
 const CSV_HEADER = ['ticket', 'sat', 'label', 'signed', 'note'] as const

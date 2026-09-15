@@ -1,5 +1,5 @@
 // Regression coverage for the bug fixed in run.ts: foldSplitOutputs used to
-// call lnurlcash-kit's settleNote on every split output, which silently
+// call @lnurlcash/kit's settleNote on every split output, which silently
 // rotates the note to obtain a signature - meaning every split was actually
 // two mutations (split, then rotate) against the mint, not one. Real-world
 // mints choked on that ("missing h" - see the commit this test landed in).
@@ -10,17 +10,29 @@
 // so an unexpected extra round trip fails the test instead of passing it.
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {secp256k1} from '@noble/curves/secp256k1.js'
-import {bytesToHex} from '@noble/hashes/utils.js'
+import {sha256} from '@noble/hashes/sha2.js'
+import {bytesToHex, utf8ToBytes} from '@noble/hashes/utils.js'
 import {
-  cashSecretAt,
-  deriveCashDomainNode,
+  configureSecretProvider,
+  decodeCp1,
+  deriveNoteSecretKey,
+  encodeCk1,
   hashK1,
-  noteSignatureDigestForHash,
+  isCk1,
+  isCp1,
+  cp1FromCk1,
+  signNoteOwnership,
   splitNote
-} from 'lnurlcash-kit'
+} from '@lnurlcash/kit'
 import {startRun, resumeRun, rotateTicketRecord} from './run'
 import {defaultConfig, emptyTier} from './lottery'
-import {cashRootFromPhrase, generateSeedPhrase, nextIndexFor} from './seed'
+import {
+  branchFor,
+  cashRootFromPhrase,
+  generateSeedPhrase,
+  nextCk1For,
+  nextIndexFor
+} from './seed'
 import type {PersistedRun} from './storage'
 
 const MINT_URL = 'https://mint.test/w'
@@ -41,6 +53,23 @@ class MemoryStorage {
 const randomHex32 = (): string =>
   bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
 
+// @lnurlcash/kit computes this internally (signature.ts) but doesn't export
+// it - the mock mint needs to reproduce it to hand back a signature the
+// code under test will actually verify.
+const LIGHTNING_SIGNED_MESSAGE_PREFIX = utf8ToBytes('Lightning Signed Message:')
+
+const noteSignatureDigestForHash = (
+  h: string,
+  amountMsat: number
+): Uint8Array => {
+  const message = utf8ToBytes(
+    `LNURLcash:${amountMsat}:${h.trim().toLowerCase()}`
+  )
+  return sha256(
+    sha256(new Uint8Array([...LIGHTNING_SIGNED_MESSAGE_PREFIX, ...message]))
+  )
+}
+
 const sign = (
   privateKey: Uint8Array,
   h: string,
@@ -53,6 +82,15 @@ const sign = (
   })
   return bytesToHex(sig)
 }
+
+// The default random-hex secret provider @lnurlcash/kit itself falls back
+// to when nothing is configured - restored before every test so a seed
+// configured by one test (see the "derives ticket secrets" test below)
+// never leaks into the next one. Production wiring (see
+// lib/lnurlcashConfig.ts) is never imported by this file, so tests own this
+// explicitly instead.
+const defaultSecretProvider = () =>
+  bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
 
 const jsonResponse = (body: unknown): Response =>
   new Response(JSON.stringify(body), {
@@ -77,16 +115,29 @@ const createMockMint = (
   refuseRotate = false
 ) => {
   const notes = new Map<string, {amountMsat: number; spent: boolean}>()
-  const committed = new Map<string, number>() // hash -> amountMsat
+  // keyed by whatever a commitment names a not-yet-disclosed output by - a
+  // raw hash for a legacy secret, a cp1 pubkey for a ck1 (Part 2) one
+  const committed = new Map<string, number>()
   notes.set(initialK1, {amountMsat: initialAmountMsat, spent: false})
   const calls: string[] = []
 
+  // the key a k1 is committed/looked up by - a hash for a legacy secret, or
+  // the cp1 pubkey a ck1 secret's signature recovers to for a Part 2 one
+  const commitmentKeyFor = (k1: string): string =>
+    isCk1(k1) ? cp1FromCk1(k1)! : hashK1(k1)
+
+  // the bytes an offline signature is actually computed over - a raw hash
+  // for a legacy commitment field, or the raw (non-bech32m) pubkey bytes for
+  // a p1/p2 one, see @lnurlcash/kit's verifyNoteSignature ck1 branch
+  const signDigestKeyFor = (fieldValue: string): string =>
+    isCp1(fieldValue) ? bytesToHex(decodeCp1(fieldValue)!) : fieldValue
+
   const activateByK1 = (k1: string) => {
     if (notes.has(k1)) return
-    const hash = hashK1(k1)
-    const amountMsat = committed.get(hash)
+    const key = commitmentKeyFor(k1)
+    const amountMsat = committed.get(key)
     if (amountMsat === undefined) return
-    committed.delete(hash)
+    committed.delete(key)
     notes.set(k1, {amountMsat, spent: false})
   }
 
@@ -102,29 +153,34 @@ const createMockMint = (
     calls.push(url.toString())
     const params = url.searchParams
     const k1 = params.get('k1')
-    const h = params.get('h')
-    const h2 = params.get('h2')
+    // a commitment field is `h`/`h2` for a legacy secret's output, `p1`/`p2`
+    // for a ck1 (Part 2) one - see @lnurlcash/kit's outputFieldName
+    const lookupKey = params.get('h') ?? params.get('p')
+    const key1 = params.get('h') ?? params.get('p1')
+    const key2 = params.get('h2') ?? params.get('p2')
 
     if (!k1) {
-      if (!h) return jsonResponse({status: 'ERROR', reason: 'missing k1'})
-      // hash-only lookup: check both a note already revealed by some other
-      // request, and one only ever committed-by-hash so far.
+      if (!lookupKey) {
+        return jsonResponse({status: 'ERROR', reason: 'missing k1'})
+      }
+      // hash/pubkey-only lookup: check both a note already revealed by some
+      // other request, and one only ever committed so far.
       for (const [noteK1, note] of notes) {
-        if (!note.spent && hashK1(noteK1) === h) {
+        if (!note.spent && commitmentKeyFor(noteK1) === lookupKey) {
           return jsonResponse({
             tag: 'withdrawRequest',
-            callback: callbackFor(h),
+            callback: callbackFor(lookupKey),
             minWithdrawable: 0,
             maxWithdrawable: note.amountMsat,
             mintPubkey
           })
         }
       }
-      const committedAmount = committed.get(h)
+      const committedAmount = committed.get(lookupKey)
       if (committedAmount !== undefined) {
         return jsonResponse({
           tag: 'withdrawRequest',
-          callback: callbackFor(h),
+          callback: callbackFor(lookupKey),
           minWithdrawable: 0,
           maxWithdrawable: committedAmount,
           mintPubkey
@@ -138,34 +194,34 @@ const createMockMint = (
       return jsonResponse({status: 'ERROR', reason: 'Unknown note.'})
     }
 
-    if (h && h2) {
+    if (key1 && key2) {
       const amountMsat = Number(params.get('amount'))
       if (!Number.isFinite(amountMsat) || amountMsat > note.amountMsat) {
         return jsonResponse({status: 'ERROR', reason: 'invalid split request'})
       }
       note.spent = true
       const changeAmountMsat = note.amountMsat - amountMsat - feePerSplitMsat
-      committed.set(h, amountMsat)
-      committed.set(h2, changeAmountMsat)
+      committed.set(key1, amountMsat)
+      committed.set(key2, changeAmountMsat)
       return jsonResponse({
         status: 'OK',
-        sig: sign(privateKey, h, amountMsat),
-        sig2: sign(privateKey, h2, changeAmountMsat)
+        sig: sign(privateKey, signDigestKeyFor(key1), amountMsat),
+        sig2: sign(privateKey, signDigestKeyFor(key2), changeAmountMsat)
       })
     }
 
-    if (h) {
+    if (key1) {
       if (refuseRotate) {
         // an outright refusal: nothing committed, nothing burned - the
         // note this mock started with is still exactly as it was
         return jsonResponse({status: 'ERROR', reason: 'rotate not allowed'})
       }
-      // rotate: burns k1, mints a fresh note of the same value under h
+      // rotate: burns k1, mints a fresh note of the same value under key1
       note.spent = true
-      committed.set(h, note.amountMsat)
+      committed.set(key1, note.amountMsat)
       return jsonResponse({
         status: 'OK',
-        sig: sign(privateKey, h, note.amountMsat)
+        sig: sign(privateKey, signDigestKeyFor(key1), note.amountMsat)
       })
     }
 
@@ -191,6 +247,10 @@ const createMockMint = (
 describe('startRun against a mock mint', () => {
   beforeEach(() => {
     vi.stubGlobal('localStorage', new MemoryStorage())
+    // reset to the plain-random default before every test, so a seed
+    // configured by one test (see "derives ticket secrets" below) never
+    // leaks into the next one
+    configureSecretProvider(defaultSecretProvider)
   })
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -364,7 +424,11 @@ describe('startRun against a mock mint', () => {
 
     const cashRoot = cashRootFromPhrase(generateSeedPhrase())
     const host = 'mint.test' // serverOf(MINT_URL)
-    const domainNode = deriveCashDomainNode(cashRoot, host)
+    const branch = branchFor(cashRoot, host)
+    // production wiring (lib/lnurlcashConfig.ts) is never imported by
+    // tests - this reproduces just enough of it for the duration of this
+    // test, reset by the top-level beforeEach afterward
+    configureSecretProvider(domain => nextCk1For(cashRoot, domain))
 
     const config = {
       ...defaultConfig(),
@@ -388,13 +452,19 @@ describe('startRun against a mock mint', () => {
 
     const byIndex = [...final.tickets].sort((a, b) => a.index - b.index)
     const k1Of = (noteUrl: string) => new URL(noteUrl).searchParams.get('k1')
+    const ck1At = (index: number) =>
+      encodeCk1(
+        signNoteOwnership(
+          deriveNoteSecretKey(branch.privateKey, branch.chainCode, index)
+        )
+      )
 
     // splitNote draws newK1 then changeK1 per call: ticket 1's secret is
     // index 0, its change (input to the next split) is index 1, ticket 2's
     // secret is index 2, and the final leftover is index 3
-    expect(k1Of(byIndex[0]!.noteUrl)).toBe(cashSecretAt(domainNode, 0))
-    expect(k1Of(byIndex[1]!.noteUrl)).toBe(cashSecretAt(domainNode, 2))
-    expect(k1Of(final.leftover!.noteUrl)).toBe(cashSecretAt(domainNode, 3))
+    expect(k1Of(byIndex[0]!.noteUrl)).toBe(ck1At(0))
+    expect(k1Of(byIndex[1]!.noteUrl)).toBe(ck1At(2))
+    expect(k1Of(final.leftover!.noteUrl)).toBe(ck1At(3))
 
     // two splits * two draws each - persisted durably, not just in memory
     expect(nextIndexFor(host)).toBe(4)

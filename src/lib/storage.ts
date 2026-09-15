@@ -18,7 +18,7 @@ export type TicketRecord = {
 
 // A secret this app generated for a mutation whose outcome is unknown - the
 // request timed out, dropped, or came back unparseable. It may already be a
-// real note (see lnurlcash-kit's AmbiguousMutationError docs): never discard
+// real note (see @lnurlcash/kit's AmbiguousMutationError docs): never discard
 // one of these without first probing whether it landed.
 export type PendingSecret = {
   role: 'ticket' | 'change'

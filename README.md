@@ -34,7 +34,7 @@ encodes is spendable by whoever holds it, same as cash.
 ## Stack
 
 TypeScript, [SolidJS](https://www.solidjs.com/), [Vite](https://vitejs.dev/),
-[`lnurlcash-kit`](https://www.npmjs.com/package/lnurlcash-kit) for the
+[`@lnurlcash/kit`](https://www.npmjs.com/package/@lnurlcash/kit) for the
 protocol, [`pdf-lib`](https://pdf-lib.js.org/) + [`qrcode`](https://www.npmjs.com/package/qrcode)
 for the print sheet (QR codes are drawn as vector rectangles, not embedded
 raster images, so they stay crisp at any print size).
